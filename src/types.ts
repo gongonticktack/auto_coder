@@ -28,10 +28,12 @@ export type Job = {
   part?: string
   duration_seconds: number | null
   start_seconds: number
-  end_seconds: number
+  end_seconds: number | null
   tuning: number[]
   notes: Note[]
   chart_events?: ChartEvent[]
+  lyrics?: { start_seconds: number, end_seconds: number, text: string }[]
+  lyrics_error?: string | null
   audio_url: string | null
   stem_url: string | null
 }

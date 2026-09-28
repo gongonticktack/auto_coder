@@ -7,6 +7,7 @@ $downloads = Join-Path $runtime 'downloads'
 $logs = Join-Path $runtime 'logs'
 $launched = @()
 $serverJob = $null
+$apiPort = 8000
 
 Add-Type -TypeDefinition @'
 using System;
@@ -96,9 +97,21 @@ function Web-Ready {
 
 function Api-Ready {
   try {
-    $health = Invoke-RestMethod 'http://127.0.0.1:8000/api/health' -TimeoutSec 2
+    $health = Invoke-RestMethod "http://127.0.0.1:$apiPort/api/health" -TimeoutSec 2
     return $health.ok -eq $true -and $health.ffmpeg -eq $true
   } catch { return $false }
+}
+
+function Port-Available([int]$port) {
+  $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, $port)
+  try {
+    $listener.Start()
+    return $true
+  } catch {
+    return $false
+  } finally {
+    $listener.Stop()
+  }
 }
 
 function Wait-Ready([scriptblock]$probe, [string]$name, [int]$processId) {
@@ -212,7 +225,7 @@ try {
     Assert-Exit 'pip install'
     Set-Content -LiteralPath $apiStamp -Value $requirementsHash -Encoding ascii
   }
-  & $venvPython -c 'from imageio_ffmpeg import get_ffmpeg_exe; from basic_pitch import ICASSP_2022_MODEL_PATH; import tensorflow, demucs; from backend.transcription import predict_notes; print(get_ffmpeg_exe()); print(ICASSP_2022_MODEL_PATH)'
+  & $venvPython -c 'from imageio_ffmpeg import get_ffmpeg_exe; from basic_pitch import ICASSP_2022_MODEL_PATH; import tensorflow, demucs, faster_whisper; from backend.transcription import predict_notes; print(get_ffmpeg_exe()); print(ICASSP_2022_MODEL_PATH)'
   Assert-Exit 'Audio dependency check'
 
   $env:TORCH_HOME = Join-Path $runtime 'torch'
@@ -235,13 +248,17 @@ try {
   if (Api-Ready -or Web-Ready) {
     throw 'A Fretlab server is already running. Close its original console before starting another one.'
   }
+  $apiPort = 8000..8010 | Where-Object { Port-Available $_ } | Select-Object -First 1
+  if (-not $apiPort) { throw 'No free API port was found between 8000 and 8010.' }
+  $env:FRETLAB_API_PORT = [string]$apiPort
+  Say "API port: $apiPort"
   $serverJob = [FretlabServerJob]::new()
 
   if (-not (Api-Ready)) {
     $apiOut = Join-Path $logs 'api.out.log'
     $apiErr = Join-Path $logs 'api.err.log'
     Say 'Starting API...'
-    $apiProcess = Start-Process -FilePath $venvPython -ArgumentList @('-m','uvicorn','backend.main:app','--host','127.0.0.1','--port','8000') `
+    $apiProcess = Start-Process -FilePath $venvPython -ArgumentList @('-m','uvicorn','backend.main:app','--host','127.0.0.1','--port',"$apiPort") `
       -WorkingDirectory $root -WindowStyle Hidden -RedirectStandardOutput $apiOut -RedirectStandardError $apiErr -PassThru
     $launched += $apiProcess
     $serverJob.Add($apiProcess)
@@ -268,12 +285,19 @@ try {
   if ($env:FRETLAB_NO_BROWSER -ne '1') { Start-Process 'http://127.0.0.1:5173/' }
   while ($true) {
     Start-Sleep -Seconds 2
-    foreach ($process in $launched) {
-      if ($process.HasExited) { throw "A server exited. Check $logs for details." }
-    }
+    if ($apiProcess.HasExited) { throw 'API server exited.' }
+    if ($webProcess.HasExited) { throw 'Web server exited.' }
   }
 } catch {
-  Write-Error "[Fretlab] $($_.Exception.Message)"
+  $message = $_.Exception.Message
+  Write-Host "[Fretlab] $message" -ForegroundColor Red
+  if ($message -match 'API|Web server') {
+    $errorLog = Join-Path $logs $(if ($message -match 'API') { 'api.err.log' } else { 'web.err.log' })
+    if (Test-Path -LiteralPath $errorLog) {
+      Write-Host "[Fretlab] Recent errors from $errorLog"
+      Get-Content -LiteralPath $errorLog -Tail 12
+    }
+  }
   exit 1
 } finally {
   if ($serverJob) { $serverJob.Dispose() }

@@ -1,12 +1,14 @@
-"""Local transcription API. It never fetches audio from a YouTube URL."""
+"""Local audio transcription API."""
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
 import sys
+import wave
 from pathlib import Path
 from threading import Lock
 from uuid import uuid4
@@ -16,7 +18,9 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from .exporters import midi, musicxml
+from .chords import attach_lyrics, suggest_chords
 from .fingering import assign_fingerings
+from .lyrics import transcribe_lyrics
 from .transcription import predict_notes
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -58,14 +62,14 @@ class NoteCreate(BaseModel):
 
 class ChartEvent(BaseModel):
     id: str = Field(min_length=1, max_length=100)
-    time_seconds: float = Field(ge=0, le=660)
+    time_seconds: float = Field(ge=0)
     chord: str = Field(default="", max_length=40)
     lyric: str = Field(default="", max_length=240)
     frets: list[int] = Field(min_length=6, max_length=6)
 
 
 class ChartUpdate(BaseModel):
-    events: list[ChartEvent] = Field(max_length=300)
+    events: list[ChartEvent] = Field(max_length=2000)
 
 
 def _directory(job_id: str) -> Path:
@@ -120,21 +124,34 @@ def _process(job_id: str) -> None:
         source = next(directory.glob("source.*"))
         normalized = directory / "normalized.wav"
         _update(job_id, status="running", stage="音源を準備", progress=8)
-        _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-ss", str(job["start_seconds"]),
-              "-i", str(source), "-t", str(job["end_seconds"] - job["start_seconds"]),
-              "-ac", "1", "-ar", "22050", str(normalized)])
+        command = [ffmpeg, "-y", "-hide_banner", "-loglevel", "error"]
+        if job["segment_enabled"]:
+            command += ["-ss", str(job["start_seconds"])]
+        command += ["-i", str(source)]
+        if job["segment_enabled"]:
+            command += ["-t", str(job["end_seconds"] - job["start_seconds"])]
+        command += ["-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le", str(normalized)]
+        _run(command)
         if not normalized.exists() or normalized.stat().st_size < 500:
-            raise RuntimeError("指定区間に音声がありません。開始・終了位置を確認してください。")
-        _update(job_id, stage="ギターを分離", progress=25, audio_url=f"/api/jobs/{job_id}/audio/original")
+            raise RuntimeError("解析できる音声がありません。音源と区間指定を確認してください。")
+        with wave.open(str(normalized), "rb") as audio_file:
+            duration = audio_file.getnframes() / audio_file.getframerate()
+        _update(job_id, duration_seconds=duration,
+                end_seconds=job["start_seconds"] + duration)
+        _update(job_id, stage="ギターとボーカルを分離", progress=25, audio_url=f"/api/jobs/{job_id}/audio/original")
         guitar = normalized
         if os.getenv("FRETLAB_SKIP_DEMUCS") != "1":
             output = directory / "stems"
-            _run([sys.executable, "-m", "demucs", "-n", "htdemucs_6s", "--two-stems", "guitar", "-o", str(output), str(normalized)])
+            _run([sys.executable, "-m", "demucs", "-n", "htdemucs_6s", "-o", str(output), str(normalized)])
             candidates = list(output.glob("**/guitar.wav"))
             if not candidates:
                 raise RuntimeError("Demucs の guitar ステムを見つけられませんでした。")
             guitar = candidates[0]
             _update(job_id, stem_url=f"/api/jobs/{job_id}/audio/guitar")
+            vocal_candidates = list(output.glob("**/vocals.wav"))
+            vocals = vocal_candidates[0] if vocal_candidates else normalized
+        else:
+            vocals = normalized
         _update(job_id, stage="音符を推定", progress=50)
         pitch_audio = directory / "pitch_input.wav"
         _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(guitar),
@@ -151,11 +168,22 @@ def _process(job_id: str) -> None:
                 "confidence": round(max(0, min(1, float(amplitude))), 3),
                 "string": 0, "fret": -1, "technique": "", "source_model": "basic-pitch",
             })
-        _update(job_id, stage="運指を最適化", progress=73)
+        _update(job_id, stage="運指を最適化", progress=70)
         notes = assign_fingerings(notes, job["tuning"])
-        _update(job_id, stage="譜面を生成", progress=91)
-        _update(job_id, notes=notes, status="completed", stage="完了", progress=100,
-                duration_seconds=job["end_seconds"] - job["start_seconds"])
+        notes = [note for note in notes if note["string"] > 0]
+        _update(job_id, stage="コードを推定", progress=78)
+        chart_events = suggest_chords(notes, job["tuning"], duration, normalized)
+        _update(job_id, stage="歌詞を認識（初回はモデルを取得）", progress=88)
+        lyrics = []
+        lyrics_error = None
+        try:
+            lyrics = transcribe_lyrics(vocals, ROOT / ".runtime" / "whisper")
+            chart_events = attach_lyrics(chart_events, lyrics)
+        except Exception as exc:
+            lyrics_error = str(exc)[:500]
+        _update(job_id, stage="譜面を生成", progress=95)
+        _update(job_id, notes=notes, chart_events=chart_events, lyrics=lyrics,
+                lyrics_error=lyrics_error, status="completed", stage="完了", progress=100)
     except Exception as exc:
         _update(job_id, status="failed", stage="エラー", error=str(exc), progress=0)
 
@@ -174,17 +202,21 @@ async def create_job(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     title: str = Form("Untitled"),
+    segment_enabled: bool = Form(False),
     start_seconds: float = Form(0),
-    end_seconds: float = Form(30),
+    end_seconds: float | None = Form(None),
     tuning: str = Form("Standard E"),
     part: str = Form("Lead guitar"),
-    youtube_url: str = Form(""),
 ) -> dict:
     extension = Path(file.filename or "").suffix.lower()
     if extension not in ALLOWED:
         raise HTTPException(400, "対応する音声形式を選んでください。")
-    if not 0 <= start_seconds < end_seconds or end_seconds - start_seconds > 60:
-        raise HTTPException(400, "解析区間は 1〜60 秒に設定してください。")
+    if segment_enabled:
+        if (end_seconds is None or not math.isfinite(start_seconds) or
+                not math.isfinite(end_seconds) or not 0 <= start_seconds < end_seconds):
+            raise HTTPException(400, "開始・終了位置を正しく指定してください。")
+    else:
+        start_seconds, end_seconds = 0, None
     if tuning not in TUNINGS:
         raise HTTPException(400, "チューニングが無効です。")
     job_id = uuid4().hex
@@ -208,10 +240,11 @@ async def create_job(
     job = {
         "id": job_id, "status": "queued", "stage": "待機中", "progress": 0, "error": None,
         "title": title[:160] or "Untitled", "duration_seconds": None,
+        "segment_enabled": segment_enabled,
         "start_seconds": start_seconds, "end_seconds": end_seconds,
         "tuning": TUNINGS[tuning], "tuning_name": tuning, "part": part[:50],
-        "youtube_url": youtube_url[:500], "notes": [], "audio_url": None, "stem_url": None,
-        "chart_events": [],
+        "notes": [], "audio_url": None, "stem_url": None,
+        "chart_events": [], "lyrics": [], "lyrics_error": None,
     }
     _save(job)
     background_tasks.add_task(_process, job_id)
@@ -294,7 +327,7 @@ def update_chart(job_id: str, update: ChartUpdate) -> dict:
     if len({event.id for event in update.events}) != len(update.events):
         raise HTTPException(400, "同じ図の ID が重複しています。")
     def operation(job: dict) -> None:
-        duration = job.get("duration_seconds") or job["end_seconds"] - job["start_seconds"]
+        duration = job.get("duration_seconds")
         if any(event.time_seconds > duration for event in update.events):
             raise HTTPException(400, "配置時刻が音源の長さを超えています。")
         job["chart_events"] = [event.model_dump() for event in sorted(update.events, key=lambda item: item.time_seconds)]

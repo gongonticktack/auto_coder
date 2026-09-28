@@ -69,13 +69,13 @@ export function ChartEditor({ events, title, playhead, duration, onSave }: {
     finally { setSaving(false) }
   }
   return <div className="chart-editor">
-    <div className="chart-editor-intro"><strong>歌詞とコード図</strong><p>歌詞とコードは手入力です。コード名を入れると基本フォームを提案します。フレットは低音弦から高音弦の順に編集できます。タブを切り替える前に変更を保存してください。</p></div>
+    <div className="chart-editor-intro"><strong>歌詞とコード図</strong><p>音源から推定した歌詞と基本コードの候補です。聴き比べて修正できます。フレットは低音弦から高音弦の順です。タブを切り替える前に変更を保存してください。</p></div>
     <ChordSheet events={draft} title={title}/>
     <div className="chart-controls"><button onClick={add}><Plus size={15}/> 再生位置に追加</button><button className="chart-save" onClick={save} disabled={!dirty || saving}><Save size={15}/> {saving ? '保存中...' : '変更を保存'}</button></div>
     {error && <div className="chart-error">{error}</div>}
     <div className="chart-event-list">{draft.map(event => <div className="chart-event-row" key={event.id}>
       <label>秒<input aria-label="配置時刻" type="number" min="0" max={duration} step="0.1" value={event.time_seconds} onChange={e => change(event.id, { time_seconds: Number(e.target.value) })}/></label>
-      <label>コード<input aria-label="コード名" value={event.chord} maxLength={40} onChange={e => change(event.id, { chord: e.target.value, frets: shapeFor(e.target.value) })}/></label>
+      <label>コード<input aria-label="コード名" value={event.chord} maxLength={40} onChange={e => change(event.id, { chord: e.target.value, frets: Object.hasOwn(SHAPES, e.target.value.trim()) ? shapeFor(e.target.value) : event.frets })}/></label>
       <label className="chart-lyric-field">歌詞<input aria-label="歌詞" value={event.lyric} maxLength={240} onChange={e => change(event.id, { lyric: e.target.value })}/></label>
       <div className="chart-fret-field"><span>フレット <small>6→1弦 · ×はミュート</small></span><div className="chart-fret-inputs">{event.frets.map((fret, index) => <select key={index} aria-label={`${6 - index}弦のフレット`} value={fret} onChange={e => change(event.id, { frets: event.frets.map((value, i) => i === index ? Number(e.target.value) : value) })}>{Array.from({ length: 26 }, (_, value) => <option key={value} value={value - 1}>{value === 0 ? '×' : value - 1}</option>)}</select>)}</div></div>
       <button className="chart-remove" aria-label="コードを削除" title="コードを削除" onClick={() => { setDraft(current => current.filter(item => item.id !== event.id)); setDirty(true) }}><Trash2 size={16}/></button>
