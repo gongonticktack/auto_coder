@@ -1,0 +1,25 @@
+.tab-mode-switch { display: flex; gap: 6px; padding: 14px 20px 0; }
+.tab-mode-switch button { border: 1px solid #38413a; border-radius: 6px; background: #1d2220; color: #a8b2a7; padding: 5px 10px; font-size: 10px; }
+.tab-mode-switch button.active { background: #344429; color: #d5f5a6; border-color: #738e58; }
+.tab-lines { position: relative; }
+.tab-playhead { position: absolute; top: -10px; bottom: -10px; width: 2px; background: #ff5656; box-shadow: 0 0 10px #ff565688; z-index: 5; pointer-events: none; }
+.tab-playhead::before { content: ''; position: absolute; top: -5px; left: -4px; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid #ff5656; }
+.chord-fret-note { color: #e2f7c4; background: #263222; border-color: #526d41; }
+.tab-chord-labels { height: 24px; position: relative; margin-top: 14px; color: #c9ed98; font: 11px 'DM Mono', monospace; }
+.tab-chord-labels span { position: absolute; transform: translateX(-50%); white-space: nowrap; }
+.chord-sheet-cell { position: relative; }
+.chord-sheet-cell.current { background: #fff5f2; border-radius: 6px; }
+.chord-sheet-playhead { position: absolute; top: 0; bottom: 0; width: 2px; background: #ed4444; box-shadow: 0 0 8px #ed444477; z-index: 2; pointer-events: none; }
+.chord-sheet-playhead::before { content: ''; position: absolute; top: -4px; left: -4px; border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid #ed4444; }
+.audio-toggle { flex-wrap: wrap; justify-content: flex-end; }
+.volume-control { display: inline-flex; align-items: center; gap: 7px; color: #a9b0ac; font-size: 10px; white-space: nowrap; }
+.volume-control input { width: 90px; accent-color: #c8ed84; }
+.volume-control span { min-width: 29px; text-align: right; font: 10px 'DM Mono', monospace; }
+.chord-download { display: inline-flex; align-items: center; gap: 4px; color: #c8ed84; text-decoration: none; font-size: 10px; white-space: nowrap; }
+.chord-download:hover { color: #e0ffa8; }
+.chord-rendering { color: #a9b0ac; font-size: 10px; white-space: nowrap; }
+@media (max-width: 950px) { .waveform-top { align-items: flex-start; gap: 10px; } .audio-toggle { max-width: 250px; } .transport { flex-wrap: wrap; } }
+.channel-selectors { display: flex; gap: 12px; margin: 12px 0 4px; flex-wrap: wrap; }
+.channel-selectors label { display: flex; align-items: center; gap: 7px; color: #b8c2b5; font-size: 10px; }
+.channel-selectors select { max-width: 200px; min-width: 145px; height: 29px; background: #1d2220; color: #e5eedf; border: 1px solid #4a5943; border-radius: 5px; padding: 0 6px; font-size: 10px; }
+.channel-selectors option { background: #1d2220; }

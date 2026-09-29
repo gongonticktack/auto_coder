@@ -1,0 +1,15 @@
+.chord-timeline-scroll { overflow-x: auto; overflow-y: hidden; }
+.chord-timeline { position: relative; height: 540px; background: repeating-linear-gradient(to right, transparent 0, transparent 107px, #e8ebe4 108px); }
+.chord-time-ruler { height: 32px; border-bottom: 1px solid #d8ddd3; position: relative; }
+.chord-time-ruler span { position: absolute; top: 8px; transform: translateX(-50%); color: #687164; font: 10px 'DM Mono', monospace; }
+.chord-timeline-track { position: relative; height: 408px; border-bottom: 1px solid #d8ddd3; }
+.chord-lyric-track { position: relative; height: 100px; }
+.timeline-track-label { position: sticky; left: 4px; top: 4px; z-index: 4; display: inline-block; color: #66725f; background: #fffdf9e8; border-radius: 3px; padding: 2px 4px; font: 10px 'Noto Sans JP', sans-serif; }
+.timeline-chord { position: absolute; width: 98px; height: 122px; }
+.timeline-chord .chord-diagram { width: 94px; height: 116px; }
+.timeline-rest { width: 90px; height: 103px; margin-top: 10px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px; border: 1px dashed #adb9a9; border-radius: 7px; background: #f3f5ef; color: #576254; }
+.timeline-rest strong { font: 700 14px 'DM Mono', monospace; }
+.timeline-rest span { font: 15px 'Noto Sans JP', sans-serif; }
+.timeline-lyric { position: absolute; display: block; padding: 6px 8px; border-left: 2px solid #bd443e; border-radius: 0 4px 4px 0; background: #fff5f1; color: #aa302c; font: 700 13px/1.35 'Noto Sans JP', sans-serif; overflow-wrap: anywhere; }
+.chord-timeline-playhead { position: absolute; top: 0; bottom: 0; width: 2px; z-index: 5; background: #ed4444; box-shadow: 0 0 9px #ed444477; pointer-events: none; }
+.chord-timeline-playhead::before { content: ''; position: absolute; top: 0; left: -5px; border-left: 6px solid transparent; border-right: 6px solid transparent; border-top: 8px solid #ed4444; }

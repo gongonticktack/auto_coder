@@ -1,4 +1,4 @@
-"""Suggest easy guitar chords from the audio's pitch classes."""
+"""Estimate chord changes from guitar audio and detected notes."""
 from __future__ import annotations
 
 import math
@@ -22,38 +22,52 @@ EASY_SHAPES = (
     (-1, -1, 3, 2, 1, 1),  # F
     (-1, 2, 4, 4, 3, 2),  # Bm
 )
-OPEN_G_SHAPES = (
-    (0, 0, 0, 0, 0, 0),  # G
-    (-1, 0, 2, 0, 1, 2),  # C
-    (-1, 2, 0, 2, 3, 4),  # D
-    (-1, 0, 2, 0, 0, 2),  # Em
-    (-1, 2, 2, 2, 1, 2),  # Am
+SEVENTH_SHAPES = (
+    (0, 2, 0, 1, 0, 0),  # E7
+    (-1, 0, 2, 0, 2, 0),  # A7
+    (-1, -1, 0, 2, 1, 2),  # D7
+    (3, 2, 0, 0, 0, 1),  # G7
+    (0, 2, 0, 0, 0, 0),  # Em7
+    (-1, 0, 2, 0, 1, 0),  # Am7
+    (-1, -1, 0, 2, 1, 1),  # Dm7
 )
-DROP_D_SHAPES = (
-    (-1, 2, 2, 1, 0, 0),  # E
-    (-1, 2, 2, 0, 0, 0),  # Em
-)
-
-
+STANDARD_LOW_TO_HIGH = (40, 45, 50, 55, 59, 64)
 def _candidates(tuning: list[int]) -> list[tuple[str, tuple[int, ...], set[int], int, float]]:
+    """Transpose familiar voicings, retaining only valid shapes in this tuning."""
     result = []
-    shapes = EASY_SHAPES
-    if tuning == [62, 59, 55, 50, 43, 38]:
-        shapes += OPEN_G_SHAPES
-    if tuning == [64, 59, 55, 50, 45, 38]:
-        shapes += DROP_D_SHAPES
-    for shape in shapes:
-        pitches = {(open_pitch + fret) % 12 for open_pitch, fret in zip(reversed(tuning), shape) if fret >= 0}
+    source_shapes = EASY_SHAPES + SEVENTH_SHAPES
+    for shape in source_shapes:
+        source_pcs = {(pitch + fret) % 12 for pitch, fret in zip(STANDARD_LOW_TO_HIGH, shape) if fret >= 0}
         for root in range(12):
-            for suffix, third in (("", 4), ("m", 3)):
-                triad = {root, (root + third) % 12, (root + 7) % 12}
-                if pitches == triad:
-                    positive = [fret for fret in shape if fret > 0]
-                    difficulty = (max(positive, default=0) * .015 +
-                                  (max(positive) - min(positive) if positive else 0) * .025 +
-                                  sum(fret > 2 for fret in shape) * .015)
-                    result.append((PITCH_NAMES[root] + suffix, shape, pitches, root, difficulty))
-    return result
+            for suffix, intervals in (("", (0, 4, 7)), ("m", (0, 3, 7)),
+                                      ("7", (0, 4, 7, 10)), ("m7", (0, 3, 7, 10))):
+                if source_pcs != {(root + interval) % 12 for interval in intervals}:
+                    continue
+                for shift in range(12):
+                    for octave in (0, 12):
+                        frets = tuple(-1 if fret < 0 else pitch + fret + shift + octave - open_pitch
+                                      for pitch, fret, open_pitch in zip(STANDARD_LOW_TO_HIGH, shape, reversed(tuning)))
+                        played = [fret for fret in frets if fret >= 0]
+                        if (not played or any(fret < 0 for original, fret in zip(shape, frets) if original >= 0)
+                                or max(played) > 20):
+                            continue
+                        positive = [fret for fret in played if fret > 0]
+                        span = max(positive) - min(positive) if positive else 0
+                        if span > 5:
+                            continue
+                        pitches = {(pitch + fret) % 12 for pitch, fret in zip(reversed(tuning), frets) if fret >= 0}
+                        bass = next((pitch + fret) % 12 for pitch, fret in zip(reversed(tuning), frets) if fret >= 0)
+                        shifted_root = (root + shift) % 12
+                        if bass != shifted_root:
+                            continue
+                        difficulty = min(positive, default=0) * .012 + span * .02 + sum(f > 4 for f in played) * .015
+                        result.append((PITCH_NAMES[shifted_root] + suffix, frets, pitches, shifted_root, difficulty))
+    best = {}
+    for candidate in result:
+        name = candidate[0]
+        if name not in best or candidate[4] < best[name][4]:
+            best[name] = candidate
+    return list(best.values())
 
 
 def _audio_profiles(path: str | Path, count: int, window_seconds: float) -> np.ndarray:
@@ -64,7 +78,7 @@ def _audio_profiles(path: str | Path, count: int, window_seconds: float) -> np.n
     if not samples.size:
         return profiles
     size = 8192
-    hop = rate // 2
+    hop = max(1, rate // 8)
     window = np.hanning(size)
     frequencies = np.fft.rfftfreq(size, 1 / rate)
     bins = [(midi % 12, np.flatnonzero(abs(frequencies - 440 * 2 ** ((midi - 69) / 12)) < rate / size * 1.5))
@@ -74,63 +88,84 @@ def _audio_profiles(path: str | Path, count: int, window_seconds: float) -> np.n
         if len(frame) < size:
             frame = np.pad(frame, (0, size - len(frame)))
         spectrum = abs(np.fft.rfft(frame * window))
-        index = min(count - 1, int(position / rate / window_seconds))
+        index = min(count - 1, int((position / rate + size / rate / 2) / window_seconds))
         for pitch_class, nearby in bins:
             if nearby.size:
-                profiles[index, pitch_class] += float(np.max(spectrum[nearby]))
+                profiles[index, pitch_class] += float(np.max(spectrum[nearby])) ** .7
     return profiles
 
 
 def suggest_chords(notes: list[dict], tuning: list[int], duration: float,
-                   audio_path: str | Path | None = None, window_seconds: float = 4) -> list[dict]:
+                   audio_path: str | Path | None = None, window_seconds: float = 1.0) -> list[dict]:
     candidates = _candidates(tuning)
     if not candidates or duration <= 0:
         return []
     count = math.ceil(duration / window_seconds)
     profiles = _audio_profiles(audio_path, count, window_seconds) if audio_path else np.zeros((count, 12))
+    note_profiles = np.zeros_like(profiles)
     for note in notes:
         start = max(0, int(note["onset_seconds"] // window_seconds))
         end = min(count, int(note["offset_seconds"] // window_seconds) + 1)
         for index in range(start, end):
             overlap = max(0, min(note["offset_seconds"], (index + 1) * window_seconds) -
                           max(note["onset_seconds"], index * window_seconds))
-            profiles[index, note["pitch"] % 12] += overlap * note.get("confidence", 1) * 5000
+            note_profiles[index, note["pitch"] % 12] += overlap * note.get("confidence", 1)
 
+    # Keep a pre-normalization energy reference for genuinely silent guitar windows.
+    audio_energy = profiles.sum(axis=1).copy()
+    note_energy = note_profiles.sum(axis=1).copy()
+    silence_floor = float(audio_energy.max(initial=0)) * .035
+    silent = (audio_energy < silence_floor) & (note_energy < .06)
+    # Normalize the two evidence sources separately so recording level does not decide the chord.
+    profiles /= np.maximum(profiles.sum(axis=1, keepdims=True), 1e-9)
+    note_profiles /= np.maximum(note_profiles.sum(axis=1, keepdims=True), 1e-9)
+    profiles = profiles * .65 + note_profiles * .35
+
+    # Dynamic programming keeps an entire progression coherent instead of deciding
+    # each window independently. A clear new chord still wins over the change cost.
+    scores = np.zeros(len(candidates))
+    backtrack = []
+    change_cost = np.array([[0 if old[0] == new[0] else (.16 if old[3] == new[3] else .24)
+                             for new in candidates] for old in candidates])
+    for profile in profiles:
+        emission = np.array([
+            1.5 * sum(profile[pitch] for pitch in pitches)
+            - .9 * sum(profile[pitch] for pitch in range(12) if pitch not in pitches)
+            + .25 * profile[root]
+            + .4 * profile[(root + (3 if name.endswith(('m', 'm7')) else 4)) % 12]
+            - difficulty - (.08 if name.endswith('7') else 0)
+            for name, _, pitches, root, difficulty in candidates
+        ])
+        transitions = scores[:, None] - change_cost
+        previous = transitions.argmax(axis=0)
+        scores = transitions[previous, np.arange(len(candidates))] + emission
+        backtrack.append(previous)
+    state = int(scores.argmax())
+    chosen = [state]
+    for previous in reversed(backtrack[1:]):
+        state = int(previous[state])
+        chosen.append(state)
+    chosen.reverse()
     events = []
-    previous_name = None
-    for index, profile in enumerate(profiles):
-        total = profile.sum()
-        if total <= 0:
+    for index, state in enumerate(chosen):
+        if silent[index] or profiles[index].sum() < .03:
+            if not events or events[-1]["chord"] != "N.C.":
+                events.append({"id": uuid4().hex, "time_seconds": round(index * window_seconds, 2),
+                               "chord": "N.C.", "lyric": "", "frets": [-1] * 6})
             continue
-        profile = profile / total
-        name, shape, _, _, _ = max(
-            candidates,
-            key=lambda item: (sum(profile[pitch] for pitch in item[2]) + profile[item[3]] * .08 -
-                              item[4] - (.09 if previous_name and item[0] != previous_name else 0)),
-        )
+        name, shape, _, _, _ = candidates[state]
+        if events and events[-1]["chord"] == name:
+            continue
         events.append({"id": uuid4().hex, "time_seconds": round(index * window_seconds, 2),
                        "chord": name, "lyric": "", "frets": list(shape)})
-        previous_name = name
     return events
 
 
 def attach_lyrics(events: list[dict], phrases: list[dict]) -> list[dict]:
+    """Put each lyric at its own recognized onset, independent of chord changes."""
     for phrase in phrases:
-        if not events or events[0]["time_seconds"] > phrase["start_seconds"]:
-            events.append({"id": uuid4().hex, "time_seconds": phrase["start_seconds"],
-                           "chord": "N.C.", "lyric": "", "frets": [-1] * 6})
-            events.sort(key=lambda event: event["time_seconds"])
-        index = max(i for i, event in enumerate(events)
-                    if event["time_seconds"] <= phrase["start_seconds"])
-        event = events[index]
-        if event["chord"] == "N.C." and event["lyric"] and phrase["start_seconds"] - event["time_seconds"] >= 4:
-            event = {"id": uuid4().hex, "time_seconds": phrase["start_seconds"],
-                     "chord": "N.C.", "lyric": "", "frets": [-1] * 6}
-            events.insert(index + 1, event)
-        if event["lyric"] and len(event["lyric"]) + len(phrase["text"]) + 1 > 240:
-            event = {"id": uuid4().hex, "time_seconds": phrase["start_seconds"],
-                     "chord": events[index]["chord"], "lyric": "",
-                     "frets": events[index]["frets"][:]}
-            events.insert(index + 1, event)
-        event["lyric"] = (event["lyric"] + " " + phrase["text"]).strip()[:240]
+        text = phrase.get("text", "").strip()
+        if text:
+            events.append({"id": uuid4().hex, "time_seconds": round(phrase["start_seconds"], 2),
+                           "chord": "", "lyric": text[:240], "frets": [-1] * 6})
     return sorted(events, key=lambda event: event["time_seconds"])

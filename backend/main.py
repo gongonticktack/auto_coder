@@ -116,6 +116,24 @@ def _ffmpeg_executable() -> str:
         raise RuntimeError("FFmpeg が見つかりません。start.bat を再実行して依存関係をインストールしてください。")
 
 
+def _make_backing(directory: Path) -> Path:
+    """Mix the non-guitar instrumental stems into a reusable WAV."""
+    destination = directory / "backing.wav"
+    if destination.exists():
+        return destination
+    stems = [next(iter((directory / "stems").glob(f"**/{name}.wav")), None)
+             for name in ("drums", "bass", "piano", "other")]
+    if any(path is None for path in stems):
+        raise FileNotFoundError("伴奏用ステムが見つかりません。")
+    temporary = directory / "backing.tmp.wav"
+    _run([_ffmpeg_executable(), "-y", "-hide_banner", "-loglevel", "error",
+          *(item for path in stems for item in ("-i", str(path))),
+          "-filter_complex", "[0:a][1:a][2:a][3:a]amix=inputs=4:duration=longest:normalize=0,alimiter=limit=0.95",
+          "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(temporary)])
+    temporary.replace(destination)
+    return destination
+
+
 def _process(job_id: str) -> None:
     directory = _directory(job_id)
     job = _load(job_id)
@@ -130,7 +148,9 @@ def _process(job_id: str) -> None:
         command += ["-i", str(source)]
         if job["segment_enabled"]:
             command += ["-t", str(job["end_seconds"] - job["start_seconds"])]
-        command += ["-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le", str(normalized)]
+        # Keep stereo and Demucs's native 44.1 kHz bandwidth during separation.
+        # Pitch estimation gets its own mono 22.05 kHz conversion below.
+        command += ["-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(normalized)]
         _run(command)
         if not normalized.exists() or normalized.stat().st_size < 500:
             raise RuntimeError("解析できる音声がありません。音源と区間指定を確認してください。")
@@ -142,12 +162,16 @@ def _process(job_id: str) -> None:
         guitar = normalized
         if os.getenv("FRETLAB_SKIP_DEMUCS") != "1":
             output = directory / "stems"
-            _run([sys.executable, "-m", "demucs", "-n", "htdemucs_6s", "-o", str(output), str(normalized)])
+            _run([sys.executable, "-m", "demucs", "-n", "htdemucs_6s",
+                  "--shifts", "2", "--overlap", "0.5", "-o", str(output), str(normalized)])
             candidates = list(output.glob("**/guitar.wav"))
             if not candidates:
                 raise RuntimeError("Demucs の guitar ステムを見つけられませんでした。")
             guitar = candidates[0]
-            _update(job_id, stem_url=f"/api/jobs/{job_id}/audio/guitar")
+            _make_backing(directory)
+            _update(job_id, stem_url=f"/api/jobs/{job_id}/audio/guitar",
+                    vocal_url=f"/api/jobs/{job_id}/audio/vocals",
+                    backing_url=f"/api/jobs/{job_id}/audio/backing")
             vocal_candidates = list(output.glob("**/vocals.wav"))
             vocals = vocal_candidates[0] if vocal_candidates else normalized
         else:
@@ -172,7 +196,7 @@ def _process(job_id: str) -> None:
         notes = assign_fingerings(notes, job["tuning"])
         notes = [note for note in notes if note["string"] > 0]
         _update(job_id, stage="コードを推定", progress=78)
-        chart_events = suggest_chords(notes, job["tuning"], duration, normalized)
+        chart_events = suggest_chords(notes, job["tuning"], duration, pitch_audio)
         _update(job_id, stage="歌詞を認識（初回はモデルを取得）", progress=88)
         lyrics = []
         lyrics_error = None
@@ -243,7 +267,7 @@ async def create_job(
         "segment_enabled": segment_enabled,
         "start_seconds": start_seconds, "end_seconds": end_seconds,
         "tuning": TUNINGS[tuning], "tuning_name": tuning, "part": part[:50],
-        "notes": [], "audio_url": None, "stem_url": None,
+        "notes": [], "audio_url": None, "stem_url": None, "vocal_url": None, "backing_url": None,
         "chart_events": [], "lyrics": [], "lyrics_error": None,
     }
     _save(job)
@@ -264,6 +288,15 @@ def get_audio(job_id: str, kind: str) -> FileResponse:
     elif kind == "guitar":
         candidates = list((directory / "stems").glob("**/guitar.wav"))
         path = candidates[0] if candidates else directory / "missing.wav"
+    elif kind == "vocals":
+        candidates = list((directory / "stems").glob("**/vocals.wav"))
+        path = candidates[0] if candidates else directory / "missing.wav"
+    elif kind == "backing":
+        with locks.setdefault(job_id, Lock()):
+            try:
+                path = _make_backing(directory)
+            except FileNotFoundError:
+                raise HTTPException(404, "伴奏音声が見つかりません。")
     else:
         raise HTTPException(404, "音声が見つかりません。")
     if not path.exists():

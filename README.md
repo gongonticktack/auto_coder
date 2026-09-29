@@ -10,11 +10,11 @@
 | `src/ChordChart.tsx` | React、SVG | 音声から推定した基本コードと歌詞を譜面に並べ、各弦のフレットや歌詞を修正できます。 |
 | `vite.config.ts`, `package.json` | Vite | 開発用 Web サーバー、React/TypeScript のビルド、`/api` から FastAPI への転送。 |
 | `src/styles.css` | CSS | ダーク UI と形が変化するビジュアル、画面幅に応じたレイアウト。 |
-| `src/App.tsx` | `lucide-react`、ブラウザーの `<audio>` と Web Audio API | アイコン、アップロード音源と分離音の再生。Web Audio の合成音はデモ専用です。 |
+| `src/App.tsx`, `src/chordAudio.ts` | `lucide-react`、ブラウザーの `<audio>` と Web Audio API | アイコン、5種類の音源の左右独立再生、録音サンプルによるアコースティックギターのコード試聴。 |
 | `src/App.tsx`, `scripts/copy-font.mjs` | [alphaTab](https://docs.alphatab.net/) | 編集済みノートから alphaTex を組み立てて譜面プレビューを描画。フォントを `public/alphatab/font` に配置します。音声解析には使用しません。 |
 | `backend/main.py` | Python 3.11、FastAPI、Pydantic、`python-multipart`、Uvicorn | 音源アップロード、ジョブ状態 API、ノートと歌詞・コード図の保存、音声配信、書き出し API。`BackgroundTasks` で解析を実行します。 |
 | `backend/main.py` | `imageio-ffmpeg` と FFmpeg | pip で入る FFmpeg 実行ファイルを使い、音源全体または指定区間を 22,050 Hz・モノラル WAV に正規化します。システム全体の PATH への FFmpeg インストールは不要です。 |
-| `backend/main.py` | PyTorch / [Demucs `htdemucs_6s`](https://github.com/facebookresearch/demucs) | 正規化した音から `guitar` と `vocals` ステムを分離し、ギター音は試聴と音符推定、ボーカル音は歌詞認識に使います。`FRETLAB_SKIP_DEMUCS=1` では元音を使います。 |
+| `backend/main.py` | PyTorch / [Demucs `htdemucs_6s`](https://github.com/facebookresearch/demucs) | 44.1 kHz ステレオの音源を2回の時間シフト推定と50%オーバーラップで分離し、`guitar` と `vocals` ステムを作ります。音符推定の入力だけ22.05 kHzモノラルに変換します。`FRETLAB_SKIP_DEMUCS=1` では元音を使います。 |
 | `backend/transcription.py`, `backend/main.py` | [Spotify Basic Pitch](https://github.com/spotify/basic-pitch) の ICASSP 2022 学習済みモデル、TensorFlow、NumPy | 22,050 Hz の WAV を約 2 秒ごとにモデルへ入力し、音高・オンセットの出力を音符の開始・終了時刻と信頼度に変換します。Windows のアプリ制御で Numba の DLL がブロックされる環境でも動くよう、推論モデルを直接呼び出します。弦・フレットはこのモデルからは得られません。 |
 | `backend/fingering.py` | 独自の制約付き探索 | 指定チューニングで各音の弦・フレット候補を列挙し、同時発音の弦重複、フレット幅、手の移動を考慮して割り当てます。 |
 | `backend/exporters.py` | Python 標準ライブラリ | 修正済みノートから、弦・フレット情報を含む MusicXML と MIDI を生成します。 |
@@ -26,6 +26,10 @@
 Tab editor の **歌詞・コード** タブで、再生位置にコードを追加します。コード名、歌詞、配置秒数、6 弦から 1 弦までのフレット（×はミュート）を編集し、**変更を保存**を押すと、そのジョブの `data/jobs/<job-id>/job.json` に記録されます。**Score view** ではコード図と歌詞を並べた譜面を表示し、下に従来の alphaTab による TAB も表示します。デモには表示確認用の歌詞とコードを含めています。
 
 歌詞とコードは音源からの推定結果です。歌唱や伴奏の分離が不完全な場合は誤認識するため、再生しながら修正してください。歌詞認識に失敗しても TAB とコード候補は保存されます。現在の MusicXML / MIDI 書き出しは音符と運指を対象とし、歌詞とコード図は含みません。
+
+再生モードは **元音源**、**ギター**、**左右比較**、**コード試聴** です。左右比較では左と右のプルダウンから **原曲**、**ギター**、**コードを弾いた場合**、**ボイス**、**ギター以外の BGM** を個別に選べます。音量スライダーは再生中にも調整できます。コード試聴は保存したコード図の各弦・フレットをチューニングから音高に変換し、[FreePats Spanish Classical Guitar](https://freepats.zenvoid.org/Guitar/acoustic-guitar.html) の CC0 録音サンプルを使ってコード切替時に低音弦から1回ストロークします。コード試聴モードではこの音を WAV で保存できます。元演奏のストロークや奏法を再現する機能ではありません。
+
+コードと歌詞の表示は秒数に比例した時間軸を使い、赤い再生線が一定速度で進みます。歌詞は認識した発話開始時刻に配置します。ギターが鳴っていないと推定した区間は `N.C.`（休）と表示します。既存の解析結果へ新しい無音判定と単語時刻による歌詞配置を適用するには、音源を再解析してください。
 
 ## AI モデルの実装範囲
 

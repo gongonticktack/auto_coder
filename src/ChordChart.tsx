@@ -1,6 +1,7 @@
-import { useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Plus, Save, Trash2 } from 'lucide-react'
-import type { ChartEvent } from './types'
+import type { ChartEvent, LyricPhrase } from './types'
+import './timeline.css'
 
 const SHAPES: Record<string, number[]> = {
   C: [-1, 3, 2, 0, 1, 0], D: [-1, -1, 0, 2, 3, 2], E: [0, 2, 2, 1, 0, 0],
@@ -14,6 +15,19 @@ const SHAPES: Record<string, number[]> = {
 
 export function shapeFor(chord: string): number[] {
   return [...(SHAPES[chord.trim()] || [-1, -1, -1, -1, -1, -1])]
+}
+
+export function alignLyrics(events: ChartEvent[], phrases: LyricPhrase[] = []): ChartEvent[] {
+  if (!phrases.length || events.some(event => !event.chord && event.lyric)) return events
+  const oldText = events.map(event => event.lyric).join('').replace(/\s+/g, '')
+  const recognizedText = phrases.map(phrase => phrase.text).join('').replace(/\s+/g, '')
+  if (oldText && oldText !== recognizedText) return events
+  const chords = events.map(event => ({ ...event, lyric: '' }))
+  const lyrics = phrases.filter(phrase => phrase.text.trim()).map((phrase, index) => ({
+    id: `lyric-${index}-${phrase.start_seconds}`, time_seconds: phrase.start_seconds,
+    chord: '', lyric: phrase.text.trim(), frets: [-1, -1, -1, -1, -1, -1],
+  }))
+  return [...chords, ...lyrics].sort((a, b) => a.time_seconds - b.time_seconds)
 }
 
 export function ChordDiagram({ chord, frets }: { chord: string, frets: number[] }) {
@@ -35,23 +49,58 @@ export function ChordDiagram({ chord, frets }: { chord: string, frets: number[] 
   </svg>
 }
 
-export function ChordSheet({ events, title }: { events: ChartEvent[], title: string }) {
+export function ChordSheet({ events, title, playhead, duration, playing = false }: {
+  events: ChartEvent[], title: string, playhead?: number, duration?: number, playing?: boolean,
+}) {
   const sorted = [...events].sort((a, b) => a.time_seconds - b.time_seconds)
+  const seconds = Math.max(1, duration ?? (sorted.at(-1)?.time_seconds || 0) + 2)
+  const pixelsPerSecond = 108
+  const width = Math.max(620, seconds * pixelsPerSecond + 130)
+  const xFor = (time: number) => 35 + Math.max(0, Math.min(seconds, time)) * pixelsPerSecond
+  const viewport = useRef<HTMLDivElement>(null)
+  const chordLanes = [-Infinity, -Infinity, -Infinity]
+  const lyricLanes = [-Infinity, -Infinity]
+  const chordItems = sorted.filter(event => event.chord.trim()).map(event => {
+    const x = xFor(event.time_seconds)
+    let lane = chordLanes.findIndex(last => x - last >= 104)
+    if (lane < 0) lane = chordLanes.indexOf(Math.min(...chordLanes))
+    chordLanes[lane] = x
+    return { event, x, lane }
+  })
+  const lyricItems = sorted.filter(event => event.lyric.trim()).map(event => {
+    const x = xFor(event.time_seconds)
+    const span = Math.max(155, Math.min(320, event.lyric.length * 13))
+    let lane = lyricLanes.findIndex(last => x - last >= 10)
+    if (lane < 0) lane = lyricLanes.indexOf(Math.min(...lyricLanes))
+    lyricLanes[lane] = x + span
+    return { event, x, lane, span }
+  })
+  useEffect(() => {
+    if (!playing || playhead === undefined || !viewport.current) return
+    const view = viewport.current
+    const x = xFor(playhead)
+    if (x > view.scrollLeft + view.clientWidth * .8 || x < view.scrollLeft + view.clientWidth * .2) {
+      view.scrollLeft = Math.max(0, x - view.clientWidth * .35)
+    }
+  }, [playhead, playing, seconds])
   return <div className="chord-sheet">
-    <div className="chord-sheet-heading"><span>CHORD &amp; LYRIC SHEET</span><h4>{title}</h4><p>コード図の下に歌詞を配置 · 音符と同じ時間軸</p></div>
-    {sorted.length ? <div className="chord-sheet-grid">{sorted.map(event => <div className="chord-sheet-cell" key={event.id}>
-      <ChordDiagram chord={event.chord} frets={event.frets}/><div className="chord-lyric">{event.lyric || '\u00a0'}</div>
-    </div>)}</div> : <div className="chord-sheet-empty">コードと歌詞を追加すると、ここに譜面として並びます。</div>}
+    <div className="chord-sheet-heading"><span>CHORD &amp; LYRIC SHEET</span><h4>{title}</h4><p>時間に沿ってコードと歌詞を表示</p></div>
+    {sorted.length ? <div className="chord-timeline-scroll" ref={viewport}><div className="chord-timeline" style={{ width }}>
+      <div className="chord-time-ruler">{Array.from({ length: Math.ceil(seconds / 2) + 1 }, (_, index) => <span key={index} style={{ left: xFor(index * 2) }}>{Math.floor(index * 2 / 60)}:{String(index * 2 % 60).padStart(2, '0')}</span>)}</div>
+      <div className="chord-timeline-track"><span className="timeline-track-label">コード</span>{chordItems.map(({ event, x, lane }) => <div key={event.id} className="timeline-chord" style={{ left: x, top: lane * 138 }} title={`${event.chord} · ${event.time_seconds.toFixed(1)}秒`}>{event.chord === 'N.C.' ? <div className="timeline-rest"><strong>N.C.</strong><span>休</span></div> : <ChordDiagram chord={event.chord} frets={event.frets}/>}</div>)}</div>
+      <div className="chord-lyric-track"><span className="timeline-track-label">歌詞</span>{lyricItems.map(({ event, x, lane, span }) => <div key={event.id} className="timeline-lyric" style={{ left: x, top: lane * 50, width: span }} title={`${event.time_seconds.toFixed(1)}秒`}>{event.lyric}</div>)}</div>
+      {playhead !== undefined && (playing || playhead > 0) && <div className="chord-timeline-playhead" style={{ left: xFor(playhead) }} aria-label={`再生位置 ${playhead.toFixed(1)}秒`}/>}
+    </div></div> : <div className="chord-sheet-empty">コードと歌詞を追加すると、ここに譜面として並びます。</div>}
   </div>
 }
 
-export function ChartEditor({ events, title, playhead, duration, onSave }: {
-  events: ChartEvent[], title: string, playhead: number, duration: number,
+export function ChartEditor({ events, lyrics = [], title, playhead, duration, playing, onSave }: {
+  events: ChartEvent[], lyrics?: LyricPhrase[], title: string, playhead: number, duration: number, playing: boolean,
   onSave: (events: ChartEvent[]) => Promise<void>,
 }) {
-  const [draft, setDraft] = useState<ChartEvent[]>(events)
+  const [draft, setDraft] = useState<ChartEvent[]>(() => alignLyrics(events, lyrics))
   const [saving, setSaving] = useState(false)
-  const [dirty, setDirty] = useState(false)
+  const [dirty, setDirty] = useState(() => alignLyrics(events, lyrics) !== events)
   const [error, setError] = useState('')
   function change(id: string, patch: Partial<ChartEvent>) {
     setDraft(current => current.map(event => event.id === id ? { ...event, ...patch } : event))
@@ -70,7 +119,7 @@ export function ChartEditor({ events, title, playhead, duration, onSave }: {
   }
   return <div className="chart-editor">
     <div className="chart-editor-intro"><strong>歌詞とコード図</strong><p>音源から推定した歌詞と基本コードの候補です。聴き比べて修正できます。フレットは低音弦から高音弦の順です。タブを切り替える前に変更を保存してください。</p></div>
-    <ChordSheet events={draft} title={title}/>
+    <ChordSheet events={draft} title={title} playhead={playhead} duration={duration} playing={playing}/>
     <div className="chart-controls"><button onClick={add}><Plus size={15}/> 再生位置に追加</button><button className="chart-save" onClick={save} disabled={!dirty || saving}><Save size={15}/> {saving ? '保存中...' : '変更を保存'}</button></div>
     {error && <div className="chart-error">{error}</div>}
     <div className="chart-event-list">{draft.map(event => <div className="chart-event-row" key={event.id}>

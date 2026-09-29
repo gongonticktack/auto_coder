@@ -18,6 +18,8 @@ export type ChartEvent = {
   frets: number[]
 }
 
+export type LyricPhrase = { start_seconds: number, end_seconds: number, text: string }
+
 export type Job = {
   id: string
   status: 'queued' | 'running' | 'completed' | 'failed'
@@ -32,10 +34,12 @@ export type Job = {
   tuning: number[]
   notes: Note[]
   chart_events?: ChartEvent[]
-  lyrics?: { start_seconds: number, end_seconds: number, text: string }[]
+  lyrics?: LyricPhrase[]
   lyrics_error?: string | null
   audio_url: string | null
   stem_url: string | null
+  vocal_url?: string | null
+  backing_url?: string | null
 }
 
 export const TUNINGS: Record<string, number[]> = {

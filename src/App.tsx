@@ -1,8 +1,14 @@
-import { useEffect, useRef, useState } from 'react'
+﻿import { useEffect, useRef, useState } from 'react'
 import { Activity, ArrowDownToLine, ArrowRight, AudioLines, Check, ChevronDown, CircleHelp, Clock3, CloudUpload, FileAudio, FileMusic, FileUp, Guitar, Headphones, LayoutGrid, LoaderCircle, MoreHorizontal, Music2, Pause, Play, Plus, RotateCcw, Settings2, SlidersHorizontal, Sparkles, Trash2, WandSparkles, Waves, X } from 'lucide-react'
 import type { ChartEvent, Job, Note } from './types'
 import { pitchName, TUNINGS, TUNING_LABELS } from './types'
-import { ChartEditor, ChordSheet, shapeFor } from './ChordChart'
+import { alignLyrics, ChartEditor, ChordSheet, shapeFor } from './ChordChart'
+import { renderChordAudio } from './chordAudio'
+import './tab.css'
+
+type AudioSource = 'original' | 'guitar' | 'chords' | 'vocals' | 'backing'
+type AudioMode = 'original' | 'guitar' | 'split' | 'chords'
+type Route = { left: GainNode, right: GainNode, center: GainNode }
 
 const demoNotes: Note[] = [
   [0, .44, 64, 1, 0], [.5, .92, 67, 1, 3], [1, 1.45, 69, 1, 5], [1.5, 1.94, 67, 1, 3],
@@ -58,8 +64,14 @@ function App() {
   const [start, setStart] = useState(0)
   const [end, setEnd] = useState(30)
   const [activeTab, setActiveTab] = useState<'tab' | 'notes' | 'chart'>('chart')
+  const [tabMode, setTabMode] = useState<'chords' | 'notes'>('chords')
   const [chartRevision, setChartRevision] = useState(0)
-  const [audioMode, setAudioMode] = useState<'original' | 'guitar'>('original')
+  const [audioMode, setAudioMode] = useState<AudioMode>('original')
+  const [leftSource, setLeftSource] = useState<AudioSource>('original')
+  const [rightSource, setRightSource] = useState<AudioSource>('guitar')
+  const [volume, setVolume] = useState(80)
+  const [chordAudioUrl, setChordAudioUrl] = useState<string | null>(null)
+  const [renderingChords, setRenderingChords] = useState(false)
   const [selectedId, setSelectedId] = useState<string | null>(demoNotes[2].id)
   const [playing, setPlaying] = useState(false)
   const [playhead, setPlayhead] = useState(0)
@@ -68,21 +80,184 @@ function App() {
   const [submitting, setSubmitting] = useState(false)
   const fileInput = useRef<HTMLInputElement>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
+  const guitarAudioRef = useRef<HTMLAudioElement>(null)
+  const chordAudioRef = useRef<HTMLAudioElement>(null)
+  const vocalAudioRef = useRef<HTMLAudioElement>(null)
+  const backingAudioRef = useRef<HTMLAudioElement>(null)
+  const stereoGraph = useRef<{ routes: Record<AudioSource, Route>, volume: GainNode } | null>(null)
+  const tabScrollRef = useRef<HTMLDivElement>(null)
   const audioContext = useRef<AudioContext | null>(null)
   const notes = job.notes
   const selected = notes.find(n => n.id === selectedId) || null
   const duration = job.duration_seconds ?? (segmentEnabled ? end - start : sourceDuration || 12)
   const measureCount = Math.max(6, Math.ceil(duration / 2))
   const tabLength = measureCount * 2
+  const tabPosition = Math.max(0, Math.min(1, playhead / tabLength))
   const jobTuningName = Object.keys(TUNINGS).find(name => TUNINGS[name].every((value, i) => value === job.tuning[i])) || 'Standard E'
   const isDemo = job.id === 'demo'
   const isWorking = job.status === 'queued' || job.status === 'running'
+  const vocalUrl = job.vocal_url || (job.stem_url ? `/api/jobs/${job.id}/audio/vocals` : null)
+  const backingUrl = job.backing_url || (job.stem_url ? `/api/jobs/${job.id}/audio/backing` : null)
+  const audioChoices: { value: AudioSource, label: string, available: boolean }[] = [
+    { value: 'original', label: '原曲', available: !isDemo },
+    { value: 'guitar', label: 'ギター', available: !!job.stem_url },
+    { value: 'chords', label: 'コード演奏', available: !!job.chart_events?.length },
+    { value: 'vocals', label: 'ボイス', available: !!vocalUrl },
+    { value: 'backing', label: 'ギター以外のBGM', available: !!backingUrl },
+  ]
+  const sourceLabel = (source: AudioSource) => audioChoices.find(choice => choice.value === source)?.label || source
   const toneTimer = useRef<number | null>(null)
+
+  function audioElements(): Record<AudioSource, HTMLAudioElement | null> {
+    return { original: audioRef.current, guitar: guitarAudioRef.current, chords: chordAudioRef.current,
+      vocals: vocalAudioRef.current, backing: backingAudioRef.current }
+  }
+
+  function audioFor(mode = audioMode, left = leftSource) {
+    return audioElements()[mode === 'split' ? left : mode]
+  }
+
+  function pauseAudio() {
+    for (const element of Object.values(audioElements())) {
+      element?.pause()
+      if (element) element.playbackRate = 1
+    }
+  }
+
+  function seekTo(time: number) {
+    const next = Math.max(0, Math.min(duration, time))
+    setPlayhead(next)
+    for (const element of Object.values(audioElements())) {
+      if (element?.readyState) element.currentTime = next
+    }
+    toneTimer.current = null
+  }
+
+  function setPanning(mode: AudioMode, left = leftSource, right = rightSource) {
+    if (!stereoGraph.current) return
+    for (const [name, route] of Object.entries(stereoGraph.current.routes) as [AudioSource, Route][]) {
+      route.left.gain.value = mode === 'split' && name === left ? 1 : 0
+      route.right.gain.value = mode === 'split' && name === right ? 1 : 0
+      route.center.gain.value = mode !== 'split' && name === mode ? 1 : 0
+    }
+  }
+
+  function prepareSplitAudio(left = leftSource, right = rightSource) {
+    const elements = audioElements()
+    if (Object.values(elements).some(element => !element)) throw new Error('比較用の音源を読み込めませんでした。')
+    const context = audioContext.current || new AudioContext()
+    audioContext.current = context
+    if (!stereoGraph.current) {
+      const leftPan = context.createStereoPanner()
+      const rightPan = context.createStereoPanner()
+      const centerPan = context.createStereoPanner()
+      leftPan.pan.value = -1
+      rightPan.pan.value = 1
+      const output = context.createGain()
+      output.gain.value = volume / 100
+      leftPan.connect(output)
+      rightPan.connect(output)
+      centerPan.connect(output)
+      output.connect(context.destination)
+      const routes = {} as Record<AudioSource, Route>
+      for (const [name, element] of Object.entries(elements) as [AudioSource, HTMLAudioElement][]) {
+        const source = context.createMediaElementSource(element)
+        const route = { left: context.createGain(), right: context.createGain(), center: context.createGain() }
+        source.connect(route.left).connect(leftPan)
+        source.connect(route.right).connect(rightPan)
+        source.connect(route.center).connect(centerPan)
+        element.volume = 1
+        routes[name] = route
+      }
+      stereoGraph.current = { routes, volume: output }
+    }
+    setPanning('split', left, right)
+    void context.resume()
+  }
+
+  async function playMode(mode: AudioMode, time: number, left = leftSource, right = rightSource) {
+    if (isDemo && mode === 'original') { setPlaying(true); return }
+    if ((mode === 'chords' || (mode === 'split' && (left === 'chords' || right === 'chords'))) && !chordAudioUrl) {
+      throw new Error('コード音声を生成中です。少し待ってから再生してください。')
+    }
+    if (mode === 'split') prepareSplitAudio(left, right)
+    else setPanning(mode)
+    const elements = audioElements()
+    const sources = mode === 'split' ? [...new Set([elements[left], elements[right]])] : [elements[mode]]
+    if (sources.some(source => !source)) throw new Error('音声を読み込めませんでした。')
+    for (const source of sources) source!.currentTime = time
+    try {
+      await Promise.all(sources.map(source => source!.play()))
+      setPlaying(true)
+    } catch (error) { pauseAudio(); throw error }
+  }
+
+  function switchAudioMode(mode: AudioMode) {
+    if (mode === audioMode) return
+    const resume = playing
+    pauseAudio()
+    setPlaying(false)
+    setAudioMode(mode)
+    if (resume) void playMode(mode, playhead).catch(error => setMessage((error as Error).message))
+  }
+
+  function switchChannel(side: 'left' | 'right', source: AudioSource) {
+    const left = side === 'left' ? source : leftSource
+    const right = side === 'right' ? source : rightSource
+    const resume = playing
+    pauseAudio()
+    setPlaying(false)
+    setLeftSource(left)
+    setRightSource(right)
+    setPanning('split', left, right)
+    if (resume) void playMode('split', playhead, left, right).catch(error => setMessage((error as Error).message))
+  }
+
+  function handleAudioEnded(source: AudioSource) {
+    if (audioMode === 'split' ? leftSource !== source : audioMode !== source) return
+    pauseAudio()
+    setPlaying(false)
+    setPlayhead(0)
+  }
 
   useEffect(() => {
     if (!localAudio) return
     return () => URL.revokeObjectURL(localAudio)
   }, [localAudio])
+
+  useEffect(() => {
+    if (stereoGraph.current) stereoGraph.current.volume.gain.value = volume / 100
+    for (const element of Object.values(audioElements())) {
+      if (element) element.volume = stereoGraph.current ? 1 : volume / 100
+    }
+  }, [volume])
+
+  useEffect(() => {
+    if (job.status !== 'completed' || !job.chart_events?.length) { setChordAudioUrl(null); setRenderingChords(false); return }
+    let cancelled = false
+    if (audioMode === 'chords' || (audioMode === 'split' && (leftSource === 'chords' || rightSource === 'chords'))) {
+      pauseAudio(); setPlaying(false)
+    }
+    setChordAudioUrl(null)
+    setRenderingChords(true)
+    const timer = window.setTimeout(async () => {
+      try {
+        const url = URL.createObjectURL(await renderChordAudio(job.chart_events || [], job.tuning, duration))
+        if (cancelled) URL.revokeObjectURL(url)
+        else {
+          setChordAudioUrl(url)
+          setRenderingChords(false)
+        }
+      } catch (error) {
+        if (!cancelled) { setRenderingChords(false); setMessage(`コード音声を生成できませんでした: ${(error as Error).message}`) }
+      }
+    }, 0)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [job.id, job.status, job.chart_events, job.tuning, duration])
+
+  useEffect(() => {
+    return () => { if (chordAudioUrl) URL.revokeObjectURL(chordAudioUrl) }
+  }, [chordAudioUrl])
 
   useEffect(() => {
     if (!isWorking || isDemo) return
@@ -109,8 +284,15 @@ function App() {
   useEffect(() => {
     if (!playing) return
     const tick = setInterval(() => {
-      if (audioRef.current && !isDemo && (job.audio_url || localAudio)) {
-        setPlayhead(audioRef.current.currentTime)
+      const source = audioFor()
+      if (source && (audioMode === 'chords' || !isDemo) && source.readyState) {
+        setPlayhead(source.currentTime)
+        const right = audioMode === 'split' ? audioElements()[rightSource] : null
+        if (right && right !== source && right.readyState) {
+          const drift = right.currentTime - source.currentTime
+          if (Math.abs(drift) > .15) right.currentTime = source.currentTime
+          else right.playbackRate = drift > .025 ? .98 : drift < -.025 ? 1.02 : 1
+        }
       } else {
         setPlayhead(value => {
           if (value >= duration) { setPlaying(false); return 0 }
@@ -119,10 +301,20 @@ function App() {
       }
     }, 50)
     return () => clearInterval(tick)
-  }, [playing, duration, localAudio, job.audio_url, isDemo])
+  }, [playing, duration, localAudio, job.audio_url, isDemo, audioMode, leftSource, rightSource])
 
   useEffect(() => {
-    if (!playing || !isDemo) return
+    if (!playing || activeTab !== 'tab' || !tabScrollRef.current) return
+    const viewport = tabScrollRef.current
+    const trackWidth = Math.max(0, viewport.scrollWidth - 70)
+    const x = 50 + trackWidth * tabPosition
+    if (x > viewport.scrollLeft + viewport.clientWidth * .8 || x < viewport.scrollLeft + 45) {
+      viewport.scrollTo({ left: Math.max(0, x - viewport.clientWidth * .35), behavior: 'instant' })
+    }
+  }, [playhead, playing, activeTab, tabPosition])
+
+  useEffect(() => {
+    if (!playing || !isDemo || audioMode !== 'original' || volume === 0) return
     const note = notes.find(n => playhead >= n.onset_seconds && playhead < n.onset_seconds + .06)
     if (!note || toneTimer.current === Math.floor(note.onset_seconds * 10)) return
     toneTimer.current = Math.floor(note.onset_seconds * 10)
@@ -133,12 +325,12 @@ function App() {
     osc.type = 'triangle'
     osc.frequency.value = 440 * Math.pow(2, (note.pitch - 69) / 12)
     gain.gain.setValueAtTime(.0001, context.currentTime)
-    gain.gain.exponentialRampToValueAtTime(.095, context.currentTime + .012)
+    gain.gain.exponentialRampToValueAtTime(.095 * volume / 100, context.currentTime + .012)
     gain.gain.exponentialRampToValueAtTime(.0001, context.currentTime + .32)
     osc.connect(gain).connect(context.destination)
     osc.start()
     osc.stop(context.currentTime + .34)
-  }, [playhead, playing, isDemo, notes])
+  }, [playhead, playing, isDemo, notes, audioMode, volume])
 
   function chooseFile(chosen: File | null) {
     if (!chosen) return
@@ -174,6 +366,9 @@ function App() {
       const body = await response.json()
       if (!response.ok) throw new Error(body.detail || '解析を開始できませんでした。')
       setJob(body as Job)
+      pauseAudio()
+      setPlaying(false)
+      setAudioMode('original')
       setSelectedId(null)
       setPlayhead(0)
     } catch (error) {
@@ -234,13 +429,10 @@ function App() {
   }
 
   function togglePlay() {
-    if (playing) { audioRef.current?.pause(); setPlaying(false); return }
-    if (playhead >= duration) setPlayhead(0)
-    if (audioRef.current && !isDemo && (job.audio_url || localAudio)) {
-      audioRef.current.currentTime = playhead
-      void audioRef.current.play().catch(() => setMessage('音声を再生できませんでした。'))
-    }
-    setPlaying(true)
+    if (playing) { pauseAudio(); setPlaying(false); return }
+    const nextTime = playhead >= duration ? 0 : playhead
+    if (playhead >= duration) seekTo(0)
+    void playMode(audioMode, nextTime).catch(error => { setPlaying(false); setMessage((error as Error).message) })
   }
 
   async function exportFile(type: 'musicxml' | 'midi') {
@@ -257,12 +449,14 @@ function App() {
   }
 
   function resetDemo() {
+    pauseAudio()
     setJob(demoJob)
     setChartRevision(value => value + 1)
     setActiveTab('chart')
     setSelectedId(demoNotes[2].id)
     setPlayhead(0)
     setPlaying(false)
+    setAudioMode('original')
     setMessage('デモセッションを開きました。')
   }
 
@@ -299,12 +493,12 @@ function App() {
         <section className="session-card"><div className="session-top"><div className="album-art"><div className="album-wave"><AudioLines size={34}/></div></div><div className="session-meta"><div className="session-overline">{isDemo ? 'DEMO SESSION' : 'YOUR TRANSCRIPTION'} <span className={`status-chip ${isWorking ? 'working' : job.status === 'failed' ? 'failed' : ''}`}>{job.status === 'completed' ? <Check size={11}/> : isWorking ? <LoaderCircle size={11} className="spin"/> : <X size={11}/>} {job.status === 'completed' ? 'READY TO EDIT' : job.status === 'failed' ? 'FAILED' : 'PROCESSING'}</span></div><h3>{job.title}</h3><div className="session-details"><span><Clock3 size={14}/> {formatTime(duration)}</span><i/><span><Guitar size={14}/> {isDemo ? 'Lead guitar' : job.part || part}</span><i/><span>{jobTuningName}</span></div></div><div className="session-actions"><button className="ghost-button" onClick={() => exportFile('musicxml')} disabled={job.status !== 'completed'}><ArrowDownToLine size={16}/> MusicXML</button><button className="square-button" onClick={() => exportFile('midi')} disabled={job.status !== 'completed'} title="MIDI をダウンロード"><MoreHorizontal size={20}/></button></div></div>
           {job.status === 'failed' && <div className="error-state">{job.error || '解析できませんでした。'}</div>}
           {isWorking && <div className="progress-panel"><div className="progress-copy"><span><LoaderCircle size={16} className="spin"/> {job.stage}</span><strong>{job.progress}%</strong></div><div className="progress-track"><span style={{width: `${job.progress}%`}}/></div><div className="stage-list">{stages.map((stage, i) => <span key={stage} className={job.progress >= [8, 25, 50, 78, 88, 95][i] ? 'done' : ''}>{stage}</span>)}</div></div>}
-          {job.status === 'completed' && <><div className="waveform-panel"><div className="waveform-top"><div><Waves size={16}/> AUDIO WAVEFORM <span>·</span> {audioMode === 'original' ? 'ORIGINAL' : 'GUITAR STEM'}</div><div className="audio-toggle"><button className={audioMode === 'original' ? 'selected' : ''} onClick={() => setAudioMode('original')}>Original</button><button className={audioMode === 'guitar' ? 'selected' : ''} onClick={() => setAudioMode('guitar')} disabled={!job.stem_url}>Guitar stem</button></div></div><div className="waveform" onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); const next = Math.max(0, Math.min(duration, (event.clientX - rect.left) / rect.width * duration)); setPlayhead(next); if (audioRef.current) audioRef.current.currentTime = next }} role="slider" aria-label="再生位置" aria-valuemin={0} aria-valuemax={duration} aria-valuenow={playhead} tabIndex={0} onKeyDown={event => { if (event.key === 'ArrowRight') setPlayhead(v => Math.min(duration, v + .5)); if (event.key === 'ArrowLeft') setPlayhead(v => Math.max(0, v - .5)) }}><div className="waveform-bars">{bars.map((height, i) => <span key={i} className={i / bars.length <= playhead / duration ? 'passed' : ''} style={{height}}/>)}</div><div className="wave-playhead" style={{left: `${Math.min(100, playhead / duration * 100)}%`}}><span/></div></div><div className="waveform-times"><span>00:00</span><span>{formatTime(duration / 4)}</span><span>{formatTime(duration / 2)}</span><span>{formatTime(duration * .75)}</span><span>{formatTime(duration)}</span></div></div>
-            <div className="transport"><button className="play-button" onClick={togglePlay} aria-label={playing ? '一時停止' : '再生'}>{playing ? <Pause size={18} fill="currentColor"/> : <Play size={18} fill="currentColor"/>}</button><div className="time-display">{formatTime(playhead)} <span>/ {formatTime(duration)}</span></div><div className="transport-divider"/><span className="transport-hint"><Headphones size={15}/> {isDemo ? 'デモ音を再生' : '音源と TAB を聴き比べ'}</span><div className="transport-spacer"/><span className="bpm">♩ 120 BPM</span><span className="meter">4 / 4</span></div></>}
+          {job.status === 'completed' && <><div className="waveform-panel"><div className="waveform-top"><div><Waves size={16}/> AUDIO WAVEFORM <span>·</span> {audioMode === 'original' ? '元音源' : audioMode === 'guitar' ? 'ギター' : audioMode === 'split' ? `左: ${sourceLabel(leftSource)} / 右: ${sourceLabel(rightSource)}` : 'コード試聴'}</div><div className="audio-toggle"><button className={audioMode === 'original' ? 'selected' : ''} onClick={() => switchAudioMode('original')}>元音源</button><button className={audioMode === 'guitar' ? 'selected' : ''} onClick={() => switchAudioMode('guitar')} disabled={!job.stem_url}>ギター</button><button className={audioMode === 'split' ? 'selected' : ''} onClick={() => switchAudioMode('split')} disabled={audioChoices.filter(choice => choice.available).length < 2}>左右比較</button><button className={audioMode === 'chords' ? 'selected' : ''} onClick={() => switchAudioMode('chords')} disabled={!job.chart_events?.length}>コード試聴</button></div></div>{audioMode === 'split' && <div className="channel-selectors"><label>左チャンネル<select aria-label="左チャンネルの音源" value={leftSource} onChange={event => switchChannel('left', event.target.value as AudioSource)}>{audioChoices.map(choice => <option key={choice.value} value={choice.value} disabled={!choice.available}>{choice.label}</option>)}</select></label><label>右チャンネル<select aria-label="右チャンネルの音源" value={rightSource} onChange={event => switchChannel('right', event.target.value as AudioSource)}>{audioChoices.map(choice => <option key={choice.value} value={choice.value} disabled={!choice.available}>{choice.label}</option>)}</select></label></div>}<div className="waveform" onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); const next = Math.max(0, Math.min(duration, (event.clientX - rect.left) / rect.width * duration)); seekTo(next) }} role="slider" aria-label="再生位置" aria-valuemin={0} aria-valuemax={duration} aria-valuenow={playhead} tabIndex={0} onKeyDown={event => { if (event.key === 'ArrowRight') seekTo(playhead + .5); if (event.key === 'ArrowLeft') seekTo(playhead - .5) }}><div className="waveform-bars">{bars.map((height, i) => <span key={i} className={i / bars.length <= playhead / duration ? 'passed' : ''} style={{height}}/>)}</div><div className="wave-playhead" style={{left: `${Math.min(100, playhead / duration * 100)}%`}}><span/></div></div><div className="waveform-times"><span>00:00</span><span>{formatTime(duration / 4)}</span><span>{formatTime(duration / 2)}</span><span>{formatTime(duration * .75)}</span><span>{formatTime(duration)}</span></div></div>
+            <div className="transport"><button className="play-button" onClick={togglePlay} aria-label={playing ? '一時停止' : '再生'}>{playing ? <Pause size={18} fill="currentColor"/> : <Play size={18} fill="currentColor"/>}</button><div className="time-display">{formatTime(playhead)} <span>/ {formatTime(duration)}</span></div><div className="transport-divider"/><span className="transport-hint"><Headphones size={15}/> {isDemo ? 'デモ音を再生' : '音源と TAB を聴き比べ'}</span><div className="transport-spacer"/><label className="volume-control">音量 <input type="range" min="0" max="100" value={volume} onChange={event => setVolume(Number(event.target.value))} aria-label="音量"/><span>{volume}%</span></label>{audioMode === 'chords' && chordAudioUrl && <a className="chord-download" href={chordAudioUrl} download={`${job.title}-chords.wav`} title="コード試聴音声を保存"><ArrowDownToLine size={14}/> WAV</a>}{audioMode === 'chords' && renderingChords && <span className="chord-rendering">生成中...</span>}{audioMode === 'chords' && <span className="chord-rendering">切替時に1ストローク</span>}<span className="bpm">♩ 120 BPM</span><span className="meter">4 / 4</span></div></>}
         </section>
 
         {job.status === 'completed' && <div className="editor-grid"><section className="tab-card"><div className="card-top"><div><h3>Tab editor</h3><p>音を選択して弦・フレットを調整</p></div><div className="editor-actions"><button onClick={addNote} title="再生位置に音を追加"><Plus size={17}/> Add note</button><button onClick={() => setShowScore(true)} title="alphaTab で譜面表示"><FileMusic size={17}/> Score view</button></div></div><div className="tab-toolbar"><div className="view-switch"><button className={activeTab === 'tab' ? 'active' : ''} onClick={() => setActiveTab('tab')}>Tablature</button><button className={activeTab === 'notes' ? 'active' : ''} onClick={() => setActiveTab('notes')}>Note events</button><button className={activeTab === 'chart' ? 'active' : ''} onClick={() => setActiveTab('chart')}>歌詞・コード</button></div><span>MEASURE 01 — {String(measureCount).padStart(2, '0')} <SlidersHorizontal size={15}/></span></div>
-          {activeTab === 'tab' ? <div className="tab-scroll"><div className="tab-sheet" style={{minWidth: `${measureCount * 105}px`}}><div className="measure-ruler">{Array.from({length: measureCount}, (_, i) => <span key={i} style={{width: `${100 / measureCount}%`}}>{String(i + 1).padStart(2, '0')}</span>)}</div><div className="tab-lines">{Array.from({length: 6}, (_, row) => <div className="tab-line" key={row}><span className="string-label">{(TUNING_LABELS[jobTuningName] || TUNING_LABELS['Standard E'])[row]}</span><div className="string-track"><div className="line-rule"/><div className="measure-lines">{Array.from({length: measureCount + 1}, (_, n) => <i key={n}/>)}</div>{notes.filter(note => note.string === row + 1 && note.onset_seconds <= tabLength).map(note => <button key={note.id} className={`fret-note ${selectedId === note.id ? 'selected' : ''} ${playhead >= note.onset_seconds && playhead < note.offset_seconds ? 'sounding' : ''}`} style={{left: `${note.onset_seconds / tabLength * 100}%`}} onClick={() => { setSelectedId(note.id); setPlayhead(note.onset_seconds); if (audioRef.current) audioRef.current.currentTime = note.onset_seconds }} title={`${pitchName(note.pitch)} · ${Math.round(note.confidence * 100)}% confidence`}>{note.fret}</button>)}</div></div>)}</div><div className="beat-ruler">{Array.from({length: measureCount * 4}, (_, i) => <span key={i}>{i % 4 + 1}</span>)}</div></div></div> : activeTab === 'chart' ? <ChartEditor key={`${job.id}-${chartRevision}`} events={job.chart_events || []} title={job.title} playhead={playhead} duration={duration} onSave={saveChart}/> : <div className="note-list"><div className="note-list-head"><span>TIME</span><span>NOTE</span><span>STRING</span><span>FRET</span><span>CONFIDENCE</span></div>{notes.map(note => <button key={note.id} className={`note-row ${selectedId === note.id ? 'selected' : ''}`} onClick={() => { setSelectedId(note.id); setPlayhead(note.onset_seconds) }}><span>{formatTime(note.onset_seconds)}.{Math.round(note.onset_seconds % 1 * 10)}</span><span>{pitchName(note.pitch)}</span><span>{note.string}</span><span>{note.fret}</span><span className="confidence"><i style={{width: `${note.confidence * 100}%`}}/> {Math.round(note.confidence * 100)}%</span></button>)}</div>}
+          {activeTab === 'tab' ? <><div className="tab-mode-switch"><button className={tabMode === 'chords' ? 'active' : ''} onClick={() => setTabMode('chords')}>コード TAB</button><button className={tabMode === 'notes' ? 'active' : ''} onClick={() => setTabMode('notes')}>単音 TAB</button></div><div className="tab-scroll" ref={tabScrollRef}><div className="tab-sheet" style={{minWidth: `${measureCount * 105}px`}}><div className="measure-ruler">{Array.from({length: measureCount}, (_, i) => <span key={i} style={{width: `${100 / measureCount}%`}}>{String(i + 1).padStart(2, '0')}</span>)}</div><div className="tab-lines">{(playing || playhead > 0) && <div className="tab-playhead" style={{left: `calc(30px + (100% - 30px) * ${tabPosition})`}} aria-label={`再生位置 ${formatTime(playhead)}`}/>}{Array.from({length: 6}, (_, row) => <div className="tab-line" key={row}><span className="string-label">{(TUNING_LABELS[jobTuningName] || TUNING_LABELS['Standard E'])[row]}</span><div className="string-track"><div className="line-rule"/><div className="measure-lines">{Array.from({length: measureCount + 1}, (_, n) => <i key={n}/>)}</div>{tabMode === 'chords' ? (job.chart_events || []).filter(event => event.time_seconds <= tabLength && event.frets[5 - row] >= 0).map(event => <span key={event.id} className="fret-note chord-fret-note" style={{left: `${event.time_seconds / tabLength * 100}%`}} title={`${event.chord} · ${formatTime(event.time_seconds)}`}>{event.frets[5 - row]}</span>) : notes.filter(note => note.string === row + 1 && note.onset_seconds <= tabLength).map(note => <button key={note.id} className={`fret-note ${selectedId === note.id ? 'selected' : ''} ${playhead >= note.onset_seconds && playhead < note.offset_seconds ? 'sounding' : ''}`} style={{left: `${note.onset_seconds / tabLength * 100}%`}} onClick={() => { setSelectedId(note.id); seekTo(note.onset_seconds) }} title={`${pitchName(note.pitch)} · ${Math.round(note.confidence * 100)}% confidence`}>{note.fret}</button>)}</div></div>)}</div>{tabMode === 'chords' && <div className="tab-chord-labels">{(job.chart_events || []).filter(event => event.time_seconds <= tabLength && event.chord.trim()).map(event => <span key={event.id} style={{left: `calc(30px + (100% - 30px) * ${event.time_seconds / tabLength})`}}>{event.chord === 'N.C.' ? '休' : event.chord}</span>)}</div>}<div className="beat-ruler">{Array.from({length: measureCount * 4}, (_, i) => <span key={i}>{i % 4 + 1}</span>)}</div></div></div></> : activeTab === 'chart' ? <ChartEditor key={`${job.id}-${chartRevision}`} events={job.chart_events || []} lyrics={job.lyrics || []} title={job.title} playhead={playhead} duration={duration} playing={playing} onSave={saveChart}/> : <div className="note-list"><div className="note-list-head"><span>TIME</span><span>NOTE</span><span>STRING</span><span>FRET</span><span>CONFIDENCE</span></div>{notes.map(note => <button key={note.id} className={`note-row ${selectedId === note.id ? 'selected' : ''}`} onClick={() => { setSelectedId(note.id); setPlayhead(note.onset_seconds) }}><span>{formatTime(note.onset_seconds)}.{Math.round(note.onset_seconds % 1 * 10)}</span><span>{pitchName(note.pitch)}</span><span>{note.string}</span><span>{note.fret}</span><span className="confidence"><i style={{width: `${note.confidence * 100}%`}}/> {Math.round(note.confidence * 100)}%</span></button>)}</div>}
           <div className="editor-footer"><span><span className="legend-dot"/> SELECTED NOTE</span><span>{notes.length} NOTES DETECTED</span></div></section>
 
           <aside className="inspector"><div className="inspector-head"><div className="inspector-icon"><Settings2 size={18}/></div><div><h3>Note inspector</h3><p>選択中の音を編集</p></div></div>{selected ? <><div className="pitch-card"><div><span>SELECTED NOTE</span><strong>{pitchName(selected.pitch)}</strong><small>{formatTime(selected.onset_seconds)} – {formatTime(selected.offset_seconds)}</small></div><div className="pitch-glyph"><Music2 size={30}/></div></div><div className="inspector-field"><label>STRING <span>{selected.string} / 6</span></label><div className="string-options">{Array.from({length: 6}, (_, i) => { const fret = selected.pitch - job.tuning[i]; return <button key={i} className={selected.string === i + 1 ? 'active' : ''} disabled={fret < 0 || fret > 24} onClick={() => updateNote({string: i + 1, fret})}>{i + 1}</button> })}</div></div><div className="inspector-field"><label>FRET <span>0 – 24</span></label><div className="fret-control"><button onClick={() => { if (selected.fret > 0) updateNote({fret: selected.fret - 1, pitch: selected.pitch - 1}) }}>−</button><strong>{selected.fret.toString().padStart(2, '0')}</strong><button onClick={() => { if (selected.fret < 24) updateNote({fret: selected.fret + 1, pitch: selected.pitch + 1}) }}>+</button></div></div><div className="inspector-field"><label>TECHNIQUE</label><div className="select-wrap technique-select"><select value={selected.technique} onChange={event => updateNote({technique: event.target.value})}><option value="">Normal</option><option value="bend">Bend</option><option value="slide">Slide</option><option value="hammer-on">Hammer-on</option><option value="pull-off">Pull-off</option><option value="mute">Mute</option></select><ChevronDown size={15}/></div></div><div className="confidence-box"><span>MODEL CONFIDENCE</span><strong>{Math.round(selected.confidence * 100)}%</strong><div><i style={{width: `${selected.confidence * 100}%`}}/></div><small>{selected.source_model === 'demo' ? 'デモ用のサンプル値' : selected.source_model}</small></div><button className="delete-note" onClick={deleteNote}><Trash2 size={15}/> この音を削除</button></> : <div className="empty-inspector">TAB 上の音を選択すると、ここで弦・フレットを調整できます。</div>}</aside></div>}
@@ -312,8 +506,12 @@ function App() {
         <div className="bottom-note"><div><span>✳</span> Made for the moments between listening and playing.</div><span>FRETLAB / 2026</span></div>
       </div>
     </main>
-    <audio ref={audioRef} src={isDemo ? undefined : audioMode === 'guitar' ? job.stem_url || undefined : job.audio_url || localAudio || undefined} onLoadedMetadata={event => { if (!job.audio_url && Number.isFinite(event.currentTarget.duration)) setSourceDuration(event.currentTarget.duration) }} onEnded={() => { setPlaying(false); setPlayhead(0) }}/>
-    {showScore && <ScoreModal notes={notes} tuning={job.tuning} title={job.title} chartEvents={job.chart_events || []} onClose={() => setShowScore(false)}/>}
+    <audio ref={audioRef} src={isDemo ? undefined : job.audio_url || localAudio || undefined} onLoadedMetadata={event => { if (!job.audio_url && Number.isFinite(event.currentTarget.duration)) setSourceDuration(event.currentTarget.duration); if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('original')}/>
+    <audio ref={guitarAudioRef} src={job.stem_url || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('guitar')}/>
+    <audio ref={chordAudioRef} src={chordAudioUrl || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('chords')}/>
+    <audio ref={vocalAudioRef} src={vocalUrl || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('vocals')}/>
+    <audio ref={backingAudioRef} src={backingUrl || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('backing')}/>
+    {showScore && <ScoreModal notes={notes} tuning={job.tuning} title={job.title} chartEvents={alignLyrics(job.chart_events || [], job.lyrics || [])} onClose={() => setShowScore(false)}/>}
   </div>
 }
 
