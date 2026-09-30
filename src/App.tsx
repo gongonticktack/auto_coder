@@ -4,23 +4,12 @@ import type { ChartEvent, Job, Note } from './types'
 import { pitchName, TUNINGS, TUNING_LABELS } from './types'
 import { alignLyrics, ChartEditor, ChordSheet, shapeFor } from './ChordChart'
 import { renderChordAudio } from './chordAudio'
+import { Separation } from './Separation'
 import './tab.css'
 
-type AudioSource = 'original' | 'guitar' | 'chords' | 'vocals' | 'backing'
+type AudioSource = 'original' | 'harmony' | 'guitar' | 'chords' | 'vocals' | 'backing'
 type AudioMode = 'original' | 'guitar' | 'split' | 'chords'
 type Route = { left: GainNode, right: GainNode, center: GainNode }
-
-const demoNotes: Note[] = [
-  [0, .44, 64, 1, 0], [.5, .92, 67, 1, 3], [1, 1.45, 69, 1, 5], [1.5, 1.94, 67, 1, 3],
-  [2, 2.45, 64, 1, 0], [2.5, 2.94, 62, 2, 3], [3, 3.43, 59, 2, 0], [3.5, 3.94, 62, 2, 3],
-  [4, 4.45, 64, 1, 0], [4.5, 4.95, 67, 1, 3], [5, 5.45, 69, 1, 5], [5.5, 5.95, 71, 1, 7],
-  [6, 6.45, 69, 1, 5], [6.5, 6.95, 67, 1, 3], [7, 7.45, 64, 1, 0], [7.5, 7.95, 62, 2, 3],
-  [8, 8.45, 59, 2, 0], [8.5, 8.95, 62, 2, 3], [9, 9.45, 64, 1, 0], [9.5, 9.95, 67, 1, 3],
-  [10, 10.45, 64, 1, 0], [10.5, 10.95, 62, 2, 3], [11, 11.45, 59, 2, 0], [11.5, 11.95, 55, 3, 0],
-].map(([onset, offset, pitch, string, fret], i) => ({
-  id: `demo-${i}`, onset_seconds: onset, offset_seconds: offset, pitch, string, fret,
-  confidence: .92 - (i % 7) * .035, technique: '', source_model: 'demo',
-}))
 
 const demoChart: ChartEvent[] = [
   [0, 'G', '夜の風に'], [1.5, 'G/B', '耳をすませ'], [3, 'C', '街を抜け'],
@@ -28,13 +17,28 @@ const demoChart: ChartEvent[] = [
   [9, 'A7', '新しい朝へ'], [10.5, 'D7', 'つなげよう'],
 ].map(([time, chord, lyric], index) => ({ id: `demo-chart-${index}`, time_seconds: Number(time), chord: String(chord), lyric: String(lyric), frets: shapeFor(String(chord)) }))
 
-const demoJob: Job = {
-  id: 'demo', status: 'completed', stage: '完了', progress: 100, error: null,
-  title: 'Midnight Drive — Lead Guitar', duration_seconds: 12, start_seconds: 0, end_seconds: 12,
-  tuning: TUNINGS['Standard E'], notes: demoNotes, chart_events: demoChart, audio_url: null, stem_url: null,
+function arrangeDemo(events: ChartEvent[]): Note[] {
+  const chords = [...events].filter(event => event.chord.trim()).sort((a, b) => a.time_seconds - b.time_seconds)
+  return Array.from({length: 24}, (_, beat) => beat * .5).flatMap((time, beat) => {
+    const chord = chords.filter(event => event.time_seconds <= time).at(-1)
+    if (!chord || chord.chord === 'N.C.') return []
+    return chord.frets.flatMap((fret, index): Note[] => fret < 0 ? [] : [{
+      id: `demo-${beat}-${index}`, onset_seconds: time, offset_seconds: time + .4,
+      pitch: TUNINGS['Standard E'][5 - index] + fret, string: 6 - index, fret,
+      confidence: 1, technique: beat % 2 ? 'strum-up' : 'strum-down', source_model: 'chord-arrangement',
+    }])
+  })
 }
 
-const stages = ['音源を準備', 'ギターとボーカルを分離', '音符を推定', 'コードを推定', '歌詞を認識', '譜面を生成']
+const demoNotes = arrangeDemo(demoChart)
+
+const demoJob: Job = {
+  id: 'demo', status: 'completed', stage: '完了', progress: 100, error: null,
+  title: 'Midnight Drive — 弾き語り伴奏', duration_seconds: 12, start_seconds: 0, end_seconds: 12,
+  tuning: TUNINGS['Standard E'], bpm: 120, beat_times: Array.from({length: 24}, (_, i) => i * .5), notes: demoNotes, chart_events: demoChart, audio_url: null, stem_url: null,
+}
+
+const stages = ['音源を準備', '和声パートを分離', 'BPM と拍を推定', 'コード進行を推定', '伴奏を編曲', '譜面を生成']
 const bars = Array.from({ length: 88 }, (_, i) => {
   const shape = Math.abs(Math.sin(i * 1.913) * Math.cos(i * .371) + Math.sin(i * .73) * .35)
   return Math.round(12 + Math.min(1, shape) * 38)
@@ -54,21 +58,21 @@ function download(data: BlobPart, type: string, name: string) {
 }
 
 function App() {
+  const [workspace, setWorkspace] = useState<'tab' | 'separation'>('tab')
   const [job, setJob] = useState<Job>(demoJob)
   const [file, setFile] = useState<File | null>(null)
   const [localAudio, setLocalAudio] = useState<string | null>(null)
   const [segmentEnabled, setSegmentEnabled] = useState(false)
   const [sourceDuration, setSourceDuration] = useState<number | null>(null)
   const [tuningName, setTuningName] = useState('Standard E')
-  const [part, setPart] = useState('Lead guitar')
   const [start, setStart] = useState(0)
   const [end, setEnd] = useState(30)
-  const [activeTab, setActiveTab] = useState<'tab' | 'notes' | 'chart'>('chart')
-  const [tabMode, setTabMode] = useState<'chords' | 'notes'>('chords')
+  const [activeTab, setActiveTab] = useState<'tab' | 'notes' | 'chart'>('tab')
+  const [tabMode, setTabMode] = useState<'chords' | 'notes'>('notes')
   const [chartRevision, setChartRevision] = useState(0)
-  const [audioMode, setAudioMode] = useState<AudioMode>('original')
-  const [leftSource, setLeftSource] = useState<AudioSource>('original')
-  const [rightSource, setRightSource] = useState<AudioSource>('guitar')
+  const [audioMode, setAudioMode] = useState<AudioMode>('split')
+  const [leftSource, setLeftSource] = useState<AudioSource>('chords')
+  const [rightSource, setRightSource] = useState<AudioSource>('chords')
   const [volume, setVolume] = useState(80)
   const [chordAudioUrl, setChordAudioUrl] = useState<string | null>(null)
   const [renderingChords, setRenderingChords] = useState(false)
@@ -81,6 +85,7 @@ function App() {
   const fileInput = useRef<HTMLInputElement>(null)
   const audioRef = useRef<HTMLAudioElement>(null)
   const guitarAudioRef = useRef<HTMLAudioElement>(null)
+  const harmonyAudioRef = useRef<HTMLAudioElement>(null)
   const chordAudioRef = useRef<HTMLAudioElement>(null)
   const vocalAudioRef = useRef<HTMLAudioElement>(null)
   const backingAudioRef = useRef<HTMLAudioElement>(null)
@@ -90,8 +95,10 @@ function App() {
   const notes = job.notes
   const selected = notes.find(n => n.id === selectedId) || null
   const duration = job.duration_seconds ?? (segmentEnabled ? end - start : sourceDuration || 12)
-  const measureCount = Math.max(6, Math.ceil(duration / 2))
-  const tabLength = measureCount * 2
+  const beatTimes = job.beat_times?.filter(time => time >= 0 && time < duration) || []
+  const measureTimes = beatTimes.length >= 2 ? beatTimes.filter((_, i) => i % 4 === 0) : Array.from({length: Math.ceil(duration / 2)}, (_, i) => i * 2)
+  const measureCount = Math.max(1, measureTimes.length)
+  const tabLength = duration
   const tabPosition = Math.max(0, Math.min(1, playhead / tabLength))
   const jobTuningName = Object.keys(TUNINGS).find(name => TUNINGS[name].every((value, i) => value === job.tuning[i])) || 'Standard E'
   const isDemo = job.id === 'demo'
@@ -100,16 +107,17 @@ function App() {
   const backingUrl = job.backing_url || (job.stem_url ? `/api/jobs/${job.id}/audio/backing` : null)
   const audioChoices: { value: AudioSource, label: string, available: boolean }[] = [
     { value: 'original', label: '原曲', available: !isDemo },
+    { value: 'harmony', label: 'コード推定用の和声パート', available: !!job.harmony_url },
     { value: 'guitar', label: 'ギター', available: !!job.stem_url },
-    { value: 'chords', label: 'コード演奏', available: !!job.chart_events?.length },
-    { value: 'vocals', label: 'ボイス', available: !!vocalUrl },
+    { value: 'chords', label: '生成したギター伴奏', available: !!job.chart_events?.length },
+    { value: 'vocals', label: 'ボーカル', available: !!vocalUrl },
     { value: 'backing', label: 'ギター以外のBGM', available: !!backingUrl },
   ]
   const sourceLabel = (source: AudioSource) => audioChoices.find(choice => choice.value === source)?.label || source
   const toneTimer = useRef<number | null>(null)
 
   function audioElements(): Record<AudioSource, HTMLAudioElement | null> {
-    return { original: audioRef.current, guitar: guitarAudioRef.current, chords: chordAudioRef.current,
+    return { original: audioRef.current, harmony: harmonyAudioRef.current, guitar: guitarAudioRef.current, chords: chordAudioRef.current,
       vocals: vocalAudioRef.current, backing: backingAudioRef.current }
   }
 
@@ -136,9 +144,9 @@ function App() {
   function setPanning(mode: AudioMode, left = leftSource, right = rightSource) {
     if (!stereoGraph.current) return
     for (const [name, route] of Object.entries(stereoGraph.current.routes) as [AudioSource, Route][]) {
-      route.left.gain.value = mode === 'split' && name === left ? 1 : 0
-      route.right.gain.value = mode === 'split' && name === right ? 1 : 0
-      route.center.gain.value = mode !== 'split' && name === mode ? 1 : 0
+      route.left.gain.value = mode === 'split' && left !== right && name === left ? 1 : 0
+      route.right.gain.value = mode === 'split' && left !== right && name === right ? 1 : 0
+      route.center.gain.value = mode === 'split' ? left === right && name === left ? 1 : 0 : name === mode ? 1 : 0
     }
   }
 
@@ -192,15 +200,6 @@ function App() {
     } catch (error) { pauseAudio(); throw error }
   }
 
-  function switchAudioMode(mode: AudioMode) {
-    if (mode === audioMode) return
-    const resume = playing
-    pauseAudio()
-    setPlaying(false)
-    setAudioMode(mode)
-    if (resume) void playMode(mode, playhead).catch(error => setMessage((error as Error).message))
-  }
-
   function switchChannel(side: 'left' | 'right', source: AudioSource) {
     const left = side === 'left' ? source : leftSource
     const right = side === 'right' ? source : rightSource
@@ -242,7 +241,7 @@ function App() {
     setRenderingChords(true)
     const timer = window.setTimeout(async () => {
       try {
-        const url = URL.createObjectURL(await renderChordAudio(job.chart_events || [], job.tuning, duration))
+        const url = URL.createObjectURL(await renderChordAudio(job.chart_events || [], job.tuning, duration, job.notes))
         if (cancelled) URL.revokeObjectURL(url)
         else {
           setChordAudioUrl(url)
@@ -253,7 +252,7 @@ function App() {
       }
     }, 0)
     return () => { cancelled = true; clearTimeout(timer) }
-  }, [job.id, job.status, job.chart_events, job.tuning, duration])
+  }, [job.id, job.status, job.chart_events, job.notes, job.tuning, duration])
 
   useEffect(() => {
     return () => { if (chordAudioUrl) URL.revokeObjectURL(chordAudioUrl) }
@@ -270,11 +269,13 @@ function App() {
         if (updated.status === 'completed') {
           setSelectedId(updated.notes[0]?.id || null)
           setPlayhead(0)
+          setActiveTab('tab')
+          setTabMode('notes')
           setMessage(updated.lyrics_error
-            ? `TAB とコードが完成しました。歌詞の認識は失敗しました: ${updated.lyrics_error}`
+            ? `弾き語り伴奏 TAB とコード進行が完成しました。歌詞の認識は失敗しました: ${updated.lyrics_error}`
             : updated.lyrics?.length
-              ? 'TAB、コード、歌詞の候補が完成しました。音を聴きながら修正できます。'
-              : 'TAB とコードが完成しました。歌詞は検出されませんでした。')
+              ? '弾き語り伴奏 TAB、コード、歌詞の候補が完成しました。'
+              : '弾き語り伴奏 TAB とコードが完成しました。歌詞は検出されませんでした。')
         }
       } catch (error) { setMessage((error as Error).message) }
     }, 1500)
@@ -360,7 +361,6 @@ function App() {
       form.append('end_seconds', String(end))
     }
     form.append('tuning', tuningName)
-    form.append('part', part)
     try {
       const response = await fetch('/api/jobs', { method: 'POST', body: form })
       const body = await response.json()
@@ -368,7 +368,9 @@ function App() {
       setJob(body as Job)
       pauseAudio()
       setPlaying(false)
-      setAudioMode('original')
+      setAudioMode('split')
+      setLeftSource('original')
+      setRightSource('original')
       setSelectedId(null)
       setPlayhead(0)
     } catch (error) {
@@ -402,9 +404,11 @@ function App() {
   }
 
   async function addNote() {
-    const onset = Math.min(duration - .5, Math.floor(playhead * 2) / 2)
+    const step = job.bpm ? 60 / job.bpm / 4 : .125
+    const origin = beatTimes[0] || 0
+    const onset = Math.max(0, Math.min(duration - step, origin + Math.round((playhead - origin) / step) * step))
     const note: Note = { id: crypto.randomUUID(), pitch: job.tuning[0], onset_seconds: onset,
-      offset_seconds: Math.min(duration, onset + .5), confidence: 1, string: 1, fret: 0,
+      offset_seconds: Math.min(duration, onset + step * 4), confidence: 1, string: 1, fret: 0,
       technique: '', source_model: 'manual' }
     setJob(current => ({ ...current, notes: [...current.notes, note].sort((a, b) => a.onset_seconds - b.onset_seconds) }))
     setSelectedId(note.id)
@@ -423,9 +427,15 @@ function App() {
         const body = await response.json().catch(() => ({}))
         throw new Error(typeof body.detail === 'string' ? body.detail : '歌詞とコードを保存できませんでした。')
       }
+      const updated = await response.json() as Job
+      setJob(updated)
+      setSelectedId(updated.notes[0]?.id || null)
+    } else {
+      const arranged = arrangeDemo(events)
+      setJob(current => ({ ...current, chart_events: events, notes: arranged }))
+      setSelectedId(arranged[0]?.id || null)
     }
-    setJob(current => ({ ...current, chart_events: events }))
-    setMessage('歌詞とコード図を保存しました。')
+    setMessage('コード進行と伴奏 TAB を更新しました。')
   }
 
   function togglePlay() {
@@ -449,6 +459,7 @@ function App() {
   }
 
   function resetDemo() {
+    setWorkspace('tab')
     pauseAudio()
     setJob(demoJob)
     setChartRevision(value => value + 1)
@@ -456,7 +467,9 @@ function App() {
     setSelectedId(demoNotes[2].id)
     setPlayhead(0)
     setPlaying(false)
-    setAudioMode('original')
+    setAudioMode('split')
+    setLeftSource('chords')
+    setRightSource('chords')
     setMessage('デモセッションを開きました。')
   }
 
@@ -465,57 +478,60 @@ function App() {
       <div className="brand"><div className="brand-icon"><Activity size={23} strokeWidth={2.4} /></div><span>fret<span className="brand-accent">lab</span><sup> BETA</sup></span></div>
       <div className="sidebar-section-label">WORKSPACE</div>
       <nav className="sidebar-nav">
-        <button className="nav-item active"><LayoutGrid size={18} /> Studio <span className="active-dot" /></button>
+        <button className={`nav-item ${workspace === 'tab' ? 'active' : ''}`} title="TAB 譜作成" onClick={() => setWorkspace('tab')} aria-current={workspace === 'tab' ? 'page' : undefined}><LayoutGrid size={18} /> TAB 譜作成 {workspace === 'tab' && <span className="active-dot" />}</button>
+        <button className={`nav-item ${workspace === 'separation' ? 'active' : ''}`} title="音源分離" onClick={() => { pauseAudio(); setPlaying(false); setWorkspace('separation') }} aria-current={workspace === 'separation' ? 'page' : undefined}><AudioLines size={18} /> 音源分離 {workspace === 'separation' && <span className="active-dot" />}</button>
         <button className="nav-item" onClick={resetDemo}><Music2 size={18} /> Demo session</button>
-        <button className="nav-item" onClick={() => document.getElementById('new-project')?.scrollIntoView({ behavior: 'smooth' })}><FileUp size={18} /> New transcription</button>
+        <button className="nav-item" onClick={() => { setWorkspace('tab'); setTimeout(() => document.getElementById('new-project')?.scrollIntoView({ behavior: 'smooth' }), 0) }}><FileUp size={18} /> New transcription</button>
       </nav>
       <div className="sidebar-section-label recent-label">YOUR SESSIONS <button title="新しいセッション" onClick={() => document.getElementById('new-project')?.scrollIntoView({ behavior: 'smooth' })}><Plus size={16} /></button></div>
-      <button className="recent-item" onClick={resetDemo}><span className="recent-icon"><AudioLines size={17} /></span><span><strong>Midnight Drive</strong><small>Demo · Lead guitar</small></span><span className="recent-indicator" /></button>
+      <button className="recent-item" onClick={resetDemo}><span className="recent-icon"><AudioLines size={17} /></span><span><strong>Midnight Drive</strong><small>Demo · 弾き語り伴奏</small></span><span className="recent-indicator" /></button>
       {!isDemo && <button className="recent-item current"><span className="recent-icon"><FileAudio size={17} /></span><span><strong>{job.title}</strong><small>{job.status === 'completed' ? 'Ready to edit' : job.stage}</small></span></button>}
       <div className="sidebar-bottom"><div className="tip-card"><div className="tip-icon"><Sparkles size={17} /></div><strong>Make it yours.</strong><p>自動生成した TAB を、耳で確かめながら仕上げましょう。</p><span>弦・フレットを直接編集 <ArrowRight size={13} /></span></div><div className="sidebar-footer"><CircleHelp size={16} /> About fretlab <span>v0.1</span></div></div>
     </aside>
 
     <main className="main-area">
-      <header className="topbar"><div className="breadcrumbs">Workspace <span>/</span> <strong>Studio</strong></div><div className="top-actions"><span className="system-status"><span /> LOCAL STUDIO</span><button className="avatar" title="Fretlab">F</button></div></header>
-      <div className="content">
-        <div className="page-intro"><div><div className="eyebrow"><span className="eyebrow-line" /> YOUR CREATIVE WORKSPACE</div><h1>Turn sound into <em>something playable.</em></h1><p>音を聴いて、弾ける形に。ギターのためのスマートな TAB スタジオ。</p></div><div className="intro-art" aria-hidden="true"><div className="orbit orbit-1"/><div className="orbit orbit-2"/><div className="orb"><Activity size={43} strokeWidth={1.15}/></div><span className="art-star one">✦</span><span className="art-star two">✦</span></div></div>
+      <header className="topbar"><div className="breadcrumbs">Workspace <span>/</span> <strong>{workspace === 'tab' ? 'TAB 譜作成' : '音源分離'}</strong></div><div className="top-actions"><span className="system-status"><span /> LOCAL STUDIO</span><button className="avatar" title="Fretlab">F</button></div></header>
+      <div className="content" hidden={workspace !== 'tab'}>
+        <div className="page-intro"><div><div className="eyebrow"><span className="eyebrow-line" /> YOUR CREATIVE WORKSPACE</div><h1>Turn sound into <em>something playable.</em></h1><p>曲のコードと拍を読み取り、弾き語りのギター伴奏に。</p></div><div className="intro-art" aria-hidden="true"><div className="orbit orbit-1"/><div className="orbit orbit-2"/><div className="orb"><Activity size={43} strokeWidth={1.15}/></div><span className="art-star one">✦</span><span className="art-star two">✦</span></div></div>
 
-        <section className="create-panel" id="new-project"><div className="panel-heading"><div className="heading-icon"><WandSparkles size={18}/></div><div><h2>新しい TAB を作成</h2><p>音源を追加して、解析したいパートを設定します</p></div><span className="step-pill">01 / SETUP</span></div>
+        <section className="create-panel" id="new-project"><div className="panel-heading"><div className="heading-icon"><WandSparkles size={18}/></div><div><h2>弾き語り伴奏 TAB を作成</h2><p>和声パートからコード進行を推定し、拍に合わせて伴奏を組み立てます</p></div><span className="step-pill">01 / SETUP</span></div>
           <div className="source-grid"><div className={`upload-zone ${file ? 'has-file' : ''}`} onClick={() => fileInput.current?.click()} onDragOver={event => event.preventDefault()} onDrop={event => { event.preventDefault(); chooseFile(event.dataTransfer.files[0]) }} role="button" tabIndex={0} onKeyDown={event => { if (event.key === 'Enter') fileInput.current?.click() }}><input ref={fileInput} type="file" accept="audio/*,.wav,.mp3,.m4a,.flac,.ogg,.aac" hidden onChange={event => chooseFile(event.target.files?.[0] || null)}/><span className="upload-icon">{file ? <FileAudio size={23}/> : <CloudUpload size={23}/>}</span><div><strong>{file ? file.name : '音源ファイルをドロップ'}</strong><span>{file ? `${(file.size / 1024 / 1024).toFixed(1)} MB · クリックして変更` : 'またはクリックしてファイルを選択'}</span></div><small>WAV, MP3, M4A, FLAC · 最大 100 MB · 全体を解析</small></div></div>
           <div className="segment-options"><label className="segment-toggle"><input type="checkbox" checked={segmentEnabled} onChange={event => setSegmentEnabled(event.target.checked)}/>指定した区間だけ生成</label>{segmentEnabled && <div className="segment-range"><label>開始（秒）<input type="number" min="0" step="0.1" value={start} onChange={event => setStart(Number(event.target.value))}/></label><span>—</span><label>終了（秒）<input type="number" min="0.1" step="0.1" value={end} onChange={event => setEnd(Number(event.target.value))}/></label></div>}</div>
-          <div className="setup-row"><div className="field"><label>GUITAR PART</label><div className="select-wrap"><Guitar size={17}/><select value={part} onChange={event => setPart(event.target.value)}><option>Lead guitar</option><option>Rhythm guitar</option><option>Single guitar</option></select><ChevronDown size={15}/></div></div><div className="field"><label>TUNING</label><div className="select-wrap"><Settings2 size={17}/><select value={tuningName} onChange={event => setTuningName(event.target.value)}>{Object.keys(TUNINGS).map(name => <option key={name}>{name}</option>)}</select><ChevronDown size={15}/></div></div><button className="generate-button" onClick={startJob} disabled={submitting || isWorking}>{submitting || isWorking ? <LoaderCircle className="spin" size={18}/> : <Sparkles size={18}/>} {isWorking ? '解析中...' : 'Generate TAB'} <ArrowRight size={17}/></button></div>
+<div className="setup-row"><div className="field"><label>TUNING</label><div className="select-wrap"><Settings2 size={17}/><select value={tuningName} onChange={event => setTuningName(event.target.value)}>{Object.keys(TUNINGS).map(name => <option key={name}>{name}</option>)}</select><ChevronDown size={15}/></div></div><button className="generate-button" onClick={startJob} disabled={submitting || isWorking}>{submitting || isWorking ? <LoaderCircle className="spin" size={18}/> : <Sparkles size={18}/>} {isWorking ? '解析中...' : 'Generate TAB'} <ArrowRight size={17}/></button></div>
         </section>
 
         {message && <div className="message-bar"><span>{message}</span><button onClick={() => setMessage(null)} aria-label="閉じる"><X size={16}/></button></div>}
 
         <div className="section-title"><div><span className="tiny-spark">✦</span><h2>Studio session</h2><span className="session-count">01</span></div><button className="text-button" onClick={resetDemo}><RotateCcw size={15}/> Demo を開く</button></div>
 
-        <section className="session-card"><div className="session-top"><div className="album-art"><div className="album-wave"><AudioLines size={34}/></div></div><div className="session-meta"><div className="session-overline">{isDemo ? 'DEMO SESSION' : 'YOUR TRANSCRIPTION'} <span className={`status-chip ${isWorking ? 'working' : job.status === 'failed' ? 'failed' : ''}`}>{job.status === 'completed' ? <Check size={11}/> : isWorking ? <LoaderCircle size={11} className="spin"/> : <X size={11}/>} {job.status === 'completed' ? 'READY TO EDIT' : job.status === 'failed' ? 'FAILED' : 'PROCESSING'}</span></div><h3>{job.title}</h3><div className="session-details"><span><Clock3 size={14}/> {formatTime(duration)}</span><i/><span><Guitar size={14}/> {isDemo ? 'Lead guitar' : job.part || part}</span><i/><span>{jobTuningName}</span></div></div><div className="session-actions"><button className="ghost-button" onClick={() => exportFile('musicxml')} disabled={job.status !== 'completed'}><ArrowDownToLine size={16}/> MusicXML</button><button className="square-button" onClick={() => exportFile('midi')} disabled={job.status !== 'completed'} title="MIDI をダウンロード"><MoreHorizontal size={20}/></button></div></div>
+          <section className="session-card"><div className="session-top"><div className="album-art"><div className="album-wave"><AudioLines size={34}/></div></div><div className="session-meta"><div className="session-overline">{isDemo ? 'DEMO SESSION' : 'YOUR TRANSCRIPTION'} <span className={`status-chip ${isWorking ? 'working' : job.status === 'failed' ? 'failed' : ''}`}>{job.status === 'completed' ? <Check size={11}/> : isWorking ? <LoaderCircle size={11} className="spin"/> : <X size={11}/>} {job.status === 'completed' ? 'READY TO EDIT' : job.status === 'failed' ? 'FAILED' : 'PROCESSING'}</span></div><h3>{job.title}</h3><div className="session-details"><span><Clock3 size={14}/> {formatTime(duration)}</span><i/><span><Guitar size={14}/> 弾き語り伴奏</span><i/><span>{jobTuningName}</span></div></div><div className="session-actions"><button className="ghost-button" onClick={() => exportFile('musicxml')} disabled={job.status !== 'completed'}><ArrowDownToLine size={16}/> MusicXML</button><button className="square-button" onClick={() => exportFile('midi')} disabled={job.status !== 'completed'} title="MIDI をダウンロード"><MoreHorizontal size={20}/></button></div></div>
           {job.status === 'failed' && <div className="error-state">{job.error || '解析できませんでした。'}</div>}
-          {isWorking && <div className="progress-panel"><div className="progress-copy"><span><LoaderCircle size={16} className="spin"/> {job.stage}</span><strong>{job.progress}%</strong></div><div className="progress-track"><span style={{width: `${job.progress}%`}}/></div><div className="stage-list">{stages.map((stage, i) => <span key={stage} className={job.progress >= [8, 25, 50, 78, 88, 95][i] ? 'done' : ''}>{stage}</span>)}</div></div>}
-          {job.status === 'completed' && <><div className="waveform-panel"><div className="waveform-top"><div><Waves size={16}/> AUDIO WAVEFORM <span>·</span> {audioMode === 'original' ? '元音源' : audioMode === 'guitar' ? 'ギター' : audioMode === 'split' ? `左: ${sourceLabel(leftSource)} / 右: ${sourceLabel(rightSource)}` : 'コード試聴'}</div><div className="audio-toggle"><button className={audioMode === 'original' ? 'selected' : ''} onClick={() => switchAudioMode('original')}>元音源</button><button className={audioMode === 'guitar' ? 'selected' : ''} onClick={() => switchAudioMode('guitar')} disabled={!job.stem_url}>ギター</button><button className={audioMode === 'split' ? 'selected' : ''} onClick={() => switchAudioMode('split')} disabled={audioChoices.filter(choice => choice.available).length < 2}>左右比較</button><button className={audioMode === 'chords' ? 'selected' : ''} onClick={() => switchAudioMode('chords')} disabled={!job.chart_events?.length}>コード試聴</button></div></div>{audioMode === 'split' && <div className="channel-selectors"><label>左チャンネル<select aria-label="左チャンネルの音源" value={leftSource} onChange={event => switchChannel('left', event.target.value as AudioSource)}>{audioChoices.map(choice => <option key={choice.value} value={choice.value} disabled={!choice.available}>{choice.label}</option>)}</select></label><label>右チャンネル<select aria-label="右チャンネルの音源" value={rightSource} onChange={event => switchChannel('right', event.target.value as AudioSource)}>{audioChoices.map(choice => <option key={choice.value} value={choice.value} disabled={!choice.available}>{choice.label}</option>)}</select></label></div>}<div className="waveform" onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); const next = Math.max(0, Math.min(duration, (event.clientX - rect.left) / rect.width * duration)); seekTo(next) }} role="slider" aria-label="再生位置" aria-valuemin={0} aria-valuemax={duration} aria-valuenow={playhead} tabIndex={0} onKeyDown={event => { if (event.key === 'ArrowRight') seekTo(playhead + .5); if (event.key === 'ArrowLeft') seekTo(playhead - .5) }}><div className="waveform-bars">{bars.map((height, i) => <span key={i} className={i / bars.length <= playhead / duration ? 'passed' : ''} style={{height}}/>)}</div><div className="wave-playhead" style={{left: `${Math.min(100, playhead / duration * 100)}%`}}><span/></div></div><div className="waveform-times"><span>00:00</span><span>{formatTime(duration / 4)}</span><span>{formatTime(duration / 2)}</span><span>{formatTime(duration * .75)}</span><span>{formatTime(duration)}</span></div></div>
-            <div className="transport"><button className="play-button" onClick={togglePlay} aria-label={playing ? '一時停止' : '再生'}>{playing ? <Pause size={18} fill="currentColor"/> : <Play size={18} fill="currentColor"/>}</button><div className="time-display">{formatTime(playhead)} <span>/ {formatTime(duration)}</span></div><div className="transport-divider"/><span className="transport-hint"><Headphones size={15}/> {isDemo ? 'デモ音を再生' : '音源と TAB を聴き比べ'}</span><div className="transport-spacer"/><label className="volume-control">音量 <input type="range" min="0" max="100" value={volume} onChange={event => setVolume(Number(event.target.value))} aria-label="音量"/><span>{volume}%</span></label>{audioMode === 'chords' && chordAudioUrl && <a className="chord-download" href={chordAudioUrl} download={`${job.title}-chords.wav`} title="コード試聴音声を保存"><ArrowDownToLine size={14}/> WAV</a>}{audioMode === 'chords' && renderingChords && <span className="chord-rendering">生成中...</span>}{audioMode === 'chords' && <span className="chord-rendering">切替時に1ストローク</span>}<span className="bpm">♩ 120 BPM</span><span className="meter">4 / 4</span></div></>}
+          {isWorking && <div className="progress-panel"><div className="progress-copy"><span><LoaderCircle size={16} className="spin"/> {job.stage}</span><strong>{job.progress}%</strong></div><div className="progress-track"><span style={{width: `${job.progress}%`}}/></div><div className="stage-list">{stages.map((stage, i) => <span key={stage} className={job.progress >= [8, 25, 43, 50, 76, 95][i] ? 'done' : ''}>{stage}</span>)}</div></div>}
+          {job.status === 'completed' && <><div className="waveform-panel"><div className="waveform-top"><div><Waves size={16}/> AUDIO WAVEFORM <span>·</span> 左右比較: {sourceLabel(leftSource)} / {sourceLabel(rightSource)}</div></div><div className="channel-selectors"><label>左チャンネル<select aria-label="左チャンネルの音源" value={leftSource} onChange={event => switchChannel('left', event.target.value as AudioSource)}>{audioChoices.map(choice => <option key={choice.value} value={choice.value} disabled={!choice.available}>{choice.label}</option>)}</select></label><label>右チャンネル<select aria-label="右チャンネルの音源" value={rightSource} onChange={event => switchChannel('right', event.target.value as AudioSource)}>{audioChoices.map(choice => <option key={choice.value} value={choice.value} disabled={!choice.available}>{choice.label}</option>)}</select></label></div><div className="waveform" onClick={event => { const rect = event.currentTarget.getBoundingClientRect(); const next = Math.max(0, Math.min(duration, (event.clientX - rect.left) / rect.width * duration)); seekTo(next) }} role="slider" aria-label="再生位置" aria-valuemin={0} aria-valuemax={duration} aria-valuenow={playhead} tabIndex={0} onKeyDown={event => { if (event.key === 'ArrowRight') seekTo(playhead + .5); if (event.key === 'ArrowLeft') seekTo(playhead - .5) }}><div className="waveform-bars">{bars.map((height, i) => <span key={i} className={i / bars.length <= playhead / duration ? 'passed' : ''} style={{height}}/>)}</div><div className="wave-playhead" style={{left: `${Math.min(100, playhead / duration * 100)}%`}}><span/></div></div><div className="waveform-times"><span>00:00</span><span>{formatTime(duration / 4)}</span><span>{formatTime(duration / 2)}</span><span>{formatTime(duration * .75)}</span><span>{formatTime(duration)}</span></div></div>
+            <div className="transport"><button className="play-button" onClick={togglePlay} aria-label={playing ? '一時停止' : '再生'}>{playing ? <Pause size={18} fill="currentColor"/> : <Play size={18} fill="currentColor"/>}</button><div className="time-display">{formatTime(playhead)} <span>/ {formatTime(duration)}</span></div><div className="transport-divider"/><span className="transport-hint"><Headphones size={15}/> {isDemo ? 'デモ音を再生' : '音源と TAB を聴き比べ'}</span><div className="transport-spacer"/><label className="volume-control">音量 <input type="range" min="0" max="100" value={volume} onChange={event => setVolume(Number(event.target.value))} aria-label="音量"/><span>{volume}%</span></label>{(leftSource === 'chords' || rightSource === 'chords') && chordAudioUrl && <a className="chord-download" href={chordAudioUrl} download={`${job.title}-chords.wav`} title="生成した伴奏音声を保存"><ArrowDownToLine size={14}/> WAV</a>}{(leftSource === 'chords' || rightSource === 'chords') && renderingChords && <span className="chord-rendering">生成中...</span>}{(leftSource === 'chords' || rightSource === 'chords') && <span className="chord-rendering">拍に合わせてストローク</span>}<span className="bpm">♩ {job.bpm ? `${job.bpm} BPM` : 'BPM 未検出'}</span><span className="meter">4 / 4 表示</span></div></>}
         </section>
 
-        {job.status === 'completed' && <div className="editor-grid"><section className="tab-card"><div className="card-top"><div><h3>Tab editor</h3><p>音を選択して弦・フレットを調整</p></div><div className="editor-actions"><button onClick={addNote} title="再生位置に音を追加"><Plus size={17}/> Add note</button><button onClick={() => setShowScore(true)} title="alphaTab で譜面表示"><FileMusic size={17}/> Score view</button></div></div><div className="tab-toolbar"><div className="view-switch"><button className={activeTab === 'tab' ? 'active' : ''} onClick={() => setActiveTab('tab')}>Tablature</button><button className={activeTab === 'notes' ? 'active' : ''} onClick={() => setActiveTab('notes')}>Note events</button><button className={activeTab === 'chart' ? 'active' : ''} onClick={() => setActiveTab('chart')}>歌詞・コード</button></div><span>MEASURE 01 — {String(measureCount).padStart(2, '0')} <SlidersHorizontal size={15}/></span></div>
-          {activeTab === 'tab' ? <><div className="tab-mode-switch"><button className={tabMode === 'chords' ? 'active' : ''} onClick={() => setTabMode('chords')}>コード TAB</button><button className={tabMode === 'notes' ? 'active' : ''} onClick={() => setTabMode('notes')}>単音 TAB</button></div><div className="tab-scroll" ref={tabScrollRef}><div className="tab-sheet" style={{minWidth: `${measureCount * 105}px`}}><div className="measure-ruler">{Array.from({length: measureCount}, (_, i) => <span key={i} style={{width: `${100 / measureCount}%`}}>{String(i + 1).padStart(2, '0')}</span>)}</div><div className="tab-lines">{(playing || playhead > 0) && <div className="tab-playhead" style={{left: `calc(30px + (100% - 30px) * ${tabPosition})`}} aria-label={`再生位置 ${formatTime(playhead)}`}/>}{Array.from({length: 6}, (_, row) => <div className="tab-line" key={row}><span className="string-label">{(TUNING_LABELS[jobTuningName] || TUNING_LABELS['Standard E'])[row]}</span><div className="string-track"><div className="line-rule"/><div className="measure-lines">{Array.from({length: measureCount + 1}, (_, n) => <i key={n}/>)}</div>{tabMode === 'chords' ? (job.chart_events || []).filter(event => event.time_seconds <= tabLength && event.frets[5 - row] >= 0).map(event => <span key={event.id} className="fret-note chord-fret-note" style={{left: `${event.time_seconds / tabLength * 100}%`}} title={`${event.chord} · ${formatTime(event.time_seconds)}`}>{event.frets[5 - row]}</span>) : notes.filter(note => note.string === row + 1 && note.onset_seconds <= tabLength).map(note => <button key={note.id} className={`fret-note ${selectedId === note.id ? 'selected' : ''} ${playhead >= note.onset_seconds && playhead < note.offset_seconds ? 'sounding' : ''}`} style={{left: `${note.onset_seconds / tabLength * 100}%`}} onClick={() => { setSelectedId(note.id); seekTo(note.onset_seconds) }} title={`${pitchName(note.pitch)} · ${Math.round(note.confidence * 100)}% confidence`}>{note.fret}</button>)}</div></div>)}</div>{tabMode === 'chords' && <div className="tab-chord-labels">{(job.chart_events || []).filter(event => event.time_seconds <= tabLength && event.chord.trim()).map(event => <span key={event.id} style={{left: `calc(30px + (100% - 30px) * ${event.time_seconds / tabLength})`}}>{event.chord === 'N.C.' ? '休' : event.chord}</span>)}</div>}<div className="beat-ruler">{Array.from({length: measureCount * 4}, (_, i) => <span key={i}>{i % 4 + 1}</span>)}</div></div></div></> : activeTab === 'chart' ? <ChartEditor key={`${job.id}-${chartRevision}`} events={job.chart_events || []} lyrics={job.lyrics || []} title={job.title} playhead={playhead} duration={duration} playing={playing} onSave={saveChart}/> : <div className="note-list"><div className="note-list-head"><span>TIME</span><span>NOTE</span><span>STRING</span><span>FRET</span><span>CONFIDENCE</span></div>{notes.map(note => <button key={note.id} className={`note-row ${selectedId === note.id ? 'selected' : ''}`} onClick={() => { setSelectedId(note.id); setPlayhead(note.onset_seconds) }}><span>{formatTime(note.onset_seconds)}.{Math.round(note.onset_seconds % 1 * 10)}</span><span>{pitchName(note.pitch)}</span><span>{note.string}</span><span>{note.fret}</span><span className="confidence"><i style={{width: `${note.confidence * 100}%`}}/> {Math.round(note.confidence * 100)}%</span></button>)}</div>}
-          <div className="editor-footer"><span><span className="legend-dot"/> SELECTED NOTE</span><span>{notes.length} NOTES DETECTED</span></div></section>
+        {job.status === 'completed' && <div className="editor-grid"><section className="tab-card"><div className="card-top"><div><h3>弾き語り伴奏 TAB</h3><p>コード進行から生成した押さえ方とストロークを編集</p></div><div className="editor-actions"><button onClick={addNote} title="再生位置に音を追加"><Plus size={17}/> Add note</button><button onClick={() => setShowScore(true)} title="alphaTab で譜面表示"><FileMusic size={17}/> Score view</button></div></div><div className="tab-toolbar"><div className="view-switch"><button className={activeTab === 'tab' ? 'active' : ''} onClick={() => setActiveTab('tab')}>Tablature</button><button className={activeTab === 'notes' ? 'active' : ''} onClick={() => setActiveTab('notes')}>Note events</button><button className={activeTab === 'chart' ? 'active' : ''} onClick={() => setActiveTab('chart')}>歌詞・コード</button></div><span>MEASURE 01 — {String(measureCount).padStart(2, '0')} <SlidersHorizontal size={15}/></span></div>
+          {activeTab === 'tab' ? <><div className="tab-mode-switch"><button className={tabMode === 'chords' ? 'active' : ''} onClick={() => setTabMode('chords')}>コード切替</button><button className={tabMode === 'notes' ? 'active' : ''} onClick={() => setTabMode('notes')}>伴奏 TAB</button></div><div className="tab-scroll" ref={tabScrollRef}><div className="tab-sheet" style={{minWidth: `${measureCount * 105}px`}}><div className="measure-ruler">{measureTimes.map((time, i) => <span key={i} style={{left: `${time / tabLength * 100}%`}}>{String(i + 1).padStart(2, '0')}</span>)}</div><div className="tab-lines">{(playing || playhead > 0) && <div className="tab-playhead" style={{left: `calc(30px + (100% - 30px) * ${tabPosition})`}} aria-label={`再生位置 ${formatTime(playhead)}`}/>}{Array.from({length: 6}, (_, row) => <div className="tab-line" key={row}><span className="string-label">{(TUNING_LABELS[jobTuningName] || TUNING_LABELS['Standard E'])[row]}</span><div className="string-track"><div className="line-rule"/><div className="measure-lines">{measureTimes.map((time, i) => <i key={i} style={{left: `${time / tabLength * 100}%`}}/>)}<i style={{left: '100%'}}/></div>{tabMode === 'chords' ? (job.chart_events || []).filter(event => event.time_seconds <= tabLength && event.frets[5 - row] >= 0).map(event => <span key={event.id} className="fret-note chord-fret-note" style={{left: `${event.time_seconds / tabLength * 100}%`}} title={`${event.chord} · ${formatTime(event.time_seconds)}`}>{event.frets[5 - row]}</span>) : notes.filter(note => note.string === row + 1 && note.onset_seconds <= tabLength).map(note => <button key={note.id} className={`fret-note ${selectedId === note.id ? 'selected' : ''} ${playhead >= note.onset_seconds && playhead < note.offset_seconds ? 'sounding' : ''}`} style={{left: `${note.onset_seconds / tabLength * 100}%`}} onClick={() => { setSelectedId(note.id); seekTo(note.onset_seconds) }} title={`${pitchName(note.pitch)} · ${note.technique === 'strum-up' ? 'アップ' : 'ダウン'}ストローク`}>{note.fret}</button>)}</div></div>)}</div>{tabMode === 'chords' && <div className="tab-chord-labels">{(job.chart_events || []).filter(event => event.time_seconds <= tabLength && event.chord.trim()).map(event => <span key={event.id} style={{left: `calc(30px + (100% - 30px) * ${event.time_seconds / tabLength})`}}>{event.chord === 'N.C.' ? '休' : event.chord}</span>)}</div>}<div className="beat-ruler">{beatTimes.map((time, i) => <span key={i} style={{left: `${time / tabLength * 100}%`}}>{i % 4 + 1}</span>)}</div></div></div></> : activeTab === 'chart' ? <ChartEditor key={`${job.id}-${chartRevision}`} events={job.chart_events || []} lyrics={job.lyrics || []} title={job.title} playhead={playhead} duration={duration} playing={playing} onSave={saveChart}/> : <div className="note-list"><div className="note-list-head"><span>TIME</span><span>NOTE</span><span>STRING</span><span>FRET</span><span>種類</span></div>{notes.map(note => <button key={note.id} className={`note-row ${selectedId === note.id ? 'selected' : ''}`} onClick={() => { setSelectedId(note.id); setPlayhead(note.onset_seconds) }}><span>{formatTime(note.onset_seconds)}.{Math.round(note.onset_seconds % 1 * 10)}</span><span>{pitchName(note.pitch)}</span><span>{note.string}</span><span>{note.fret}</span><span>{note.source_model === 'chord-arrangement' ? '伴奏' : '編集音'}</span></button>)}</div>}
+          <div className="editor-footer"><span><span className="legend-dot"/> SELECTED NOTE</span><span>{notes.length} 伴奏音</span></div></section>
 
-          <aside className="inspector"><div className="inspector-head"><div className="inspector-icon"><Settings2 size={18}/></div><div><h3>Note inspector</h3><p>選択中の音を編集</p></div></div>{selected ? <><div className="pitch-card"><div><span>SELECTED NOTE</span><strong>{pitchName(selected.pitch)}</strong><small>{formatTime(selected.onset_seconds)} – {formatTime(selected.offset_seconds)}</small></div><div className="pitch-glyph"><Music2 size={30}/></div></div><div className="inspector-field"><label>STRING <span>{selected.string} / 6</span></label><div className="string-options">{Array.from({length: 6}, (_, i) => { const fret = selected.pitch - job.tuning[i]; return <button key={i} className={selected.string === i + 1 ? 'active' : ''} disabled={fret < 0 || fret > 24} onClick={() => updateNote({string: i + 1, fret})}>{i + 1}</button> })}</div></div><div className="inspector-field"><label>FRET <span>0 – 24</span></label><div className="fret-control"><button onClick={() => { if (selected.fret > 0) updateNote({fret: selected.fret - 1, pitch: selected.pitch - 1}) }}>−</button><strong>{selected.fret.toString().padStart(2, '0')}</strong><button onClick={() => { if (selected.fret < 24) updateNote({fret: selected.fret + 1, pitch: selected.pitch + 1}) }}>+</button></div></div><div className="inspector-field"><label>TECHNIQUE</label><div className="select-wrap technique-select"><select value={selected.technique} onChange={event => updateNote({technique: event.target.value})}><option value="">Normal</option><option value="bend">Bend</option><option value="slide">Slide</option><option value="hammer-on">Hammer-on</option><option value="pull-off">Pull-off</option><option value="mute">Mute</option></select><ChevronDown size={15}/></div></div><div className="confidence-box"><span>MODEL CONFIDENCE</span><strong>{Math.round(selected.confidence * 100)}%</strong><div><i style={{width: `${selected.confidence * 100}%`}}/></div><small>{selected.source_model === 'demo' ? 'デモ用のサンプル値' : selected.source_model}</small></div><button className="delete-note" onClick={deleteNote}><Trash2 size={15}/> この音を削除</button></> : <div className="empty-inspector">TAB 上の音を選択すると、ここで弦・フレットを調整できます。</div>}</aside></div>}
+          <aside className="inspector"><div className="inspector-head"><div className="inspector-icon"><Settings2 size={18}/></div><div><h3>Note inspector</h3><p>選択中の音を編集</p></div></div>{selected ? <><div className="pitch-card"><div><span>SELECTED NOTE</span><strong>{pitchName(selected.pitch)}</strong><small>{formatTime(selected.onset_seconds)} – {formatTime(selected.offset_seconds)}</small></div><div className="pitch-glyph"><Music2 size={30}/></div></div><div className="inspector-field"><label>STRING <span>{selected.string} / 6</span></label><div className="string-options">{Array.from({length: 6}, (_, i) => { const fret = selected.pitch - job.tuning[i]; return <button key={i} className={selected.string === i + 1 ? 'active' : ''} disabled={fret < 0 || fret > 24} onClick={() => updateNote({string: i + 1, fret})}>{i + 1}</button> })}</div></div><div className="inspector-field"><label>FRET <span>0 – 24</span></label><div className="fret-control"><button onClick={() => { if (selected.fret > 0) updateNote({fret: selected.fret - 1, pitch: selected.pitch - 1}) }}>−</button><strong>{selected.fret.toString().padStart(2, '0')}</strong><button onClick={() => { if (selected.fret < 24) updateNote({fret: selected.fret + 1, pitch: selected.pitch + 1}) }}>+</button></div></div><div className="inspector-field"><label>TECHNIQUE</label><div className="select-wrap technique-select"><select value={selected.technique} onChange={event => updateNote({technique: event.target.value})}><option value="">Normal</option><option value="strum-down">Down strum</option><option value="strum-up">Up strum</option><option value="bend">Bend</option><option value="slide">Slide</option><option value="hammer-on">Hammer-on</option><option value="pull-off">Pull-off</option><option value="mute">Mute</option></select><ChevronDown size={15}/></div></div><div className="confidence-box"><span>生成元</span><strong>{selected.source_model === 'chord-arrangement' ? 'コード進行' : '手動編集'}</strong><div><i style={{width: `${selected.confidence * 100}%`}}/></div><small>{selected.source_model === 'chord-arrangement' ? '拍に合わせて生成した伴奏音' : selected.source_model}</small></div><button className="delete-note" onClick={deleteNote}><Trash2 size={15}/> この音を削除</button></> : <div className="empty-inspector">TAB 上の音を選択すると、ここで弦・フレットを調整できます。</div>}</aside></div>}
 
         <div className="bottom-note"><div><span>✳</span> Made for the moments between listening and playing.</div><span>FRETLAB / 2026</span></div>
       </div>
+      <div className="content" hidden={workspace !== 'separation'}><Separation /></div>
     </main>
     <audio ref={audioRef} src={isDemo ? undefined : job.audio_url || localAudio || undefined} onLoadedMetadata={event => { if (!job.audio_url && Number.isFinite(event.currentTarget.duration)) setSourceDuration(event.currentTarget.duration); if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('original')}/>
     <audio ref={guitarAudioRef} src={job.stem_url || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('guitar')}/>
+    <audio ref={harmonyAudioRef} src={job.harmony_url || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('harmony')}/>
     <audio ref={chordAudioRef} src={chordAudioUrl || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('chords')}/>
     <audio ref={vocalAudioRef} src={vocalUrl || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('vocals')}/>
     <audio ref={backingAudioRef} src={backingUrl || undefined} onLoadedMetadata={event => { if (playhead > 0) event.currentTarget.currentTime = playhead }} onEnded={() => handleAudioEnded('backing')}/>
-    {showScore && <ScoreModal notes={notes} tuning={job.tuning} title={job.title} chartEvents={alignLyrics(job.chart_events || [], job.lyrics || [])} onClose={() => setShowScore(false)}/>}
+    {showScore && <ScoreModal notes={notes} tuning={job.tuning} title={job.title} bpm={job.bpm || 120} chartEvents={alignLyrics(job.chart_events || [], job.lyrics || [])} onClose={() => setShowScore(false)}/>}
   </div>
 }
 
-function ScoreModal({notes, tuning, title, chartEvents, onClose}: {notes: Note[], tuning: number[], title: string, chartEvents: ChartEvent[], onClose: () => void}) {
+function ScoreModal({notes, tuning, title, bpm, chartEvents, onClose}: {notes: Note[], tuning: number[], title: string, bpm: number, chartEvents: ChartEvent[], onClose: () => void}) {
   const container = useRef<HTMLDivElement>(null)
   const [error, setError] = useState<string | null>(null)
   useEffect(() => {
@@ -529,15 +545,28 @@ function ScoreModal({notes, tuning, title, chartEvents, onClose}: {notes: Note[]
       settings.display.scale = .9
       const instance = new alphaTab.AlphaTabApi(container.current, settings)
       api = instance
-      const sorted = [...notes].filter(n => n.string > 0 && n.fret >= 0).sort((a, b) => a.onset_seconds - b.onset_seconds).slice(0, 64)
-      const body = sorted.map(n => `${n.fret}.${n.string}.8`).join(' ')
+      const sorted = [...notes].filter(n => n.string > 0 && n.fret >= 0).sort((a, b) => a.onset_seconds - b.onset_seconds).slice(0, 384)
+      const slotSeconds = 60 / bpm / 4
+      const slotCount = Math.max(16, Math.min(512, Math.ceil((sorted.at(-1)?.offset_seconds || 0) / slotSeconds)))
+      const groups = new Map<number, Note[]>()
+      for (const note of sorted) {
+        const slot = Math.round(note.onset_seconds / slotSeconds)
+        if (slot < slotCount) groups.set(slot, [...(groups.get(slot) || []), note])
+      }
+      const bars = Array.from({length: Math.ceil(slotCount / 16)}, (_, bar) =>
+        Array.from({length: 16}, (_, step) => {
+          const group = groups.get(bar * 16 + step) || []
+          return group.length > 1 ? `(${group.map(note => `${note.fret}.${note.string}`).join(' ')}).16`
+            : group.length ? `${group[0].fret}.${group[0].string}.16` : 'r.16'
+        }).join(' '))
+      const body = bars.join(' | ')
       const names = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
       const tuningText = tuning.map(midi => `${names[midi % 12]}${Math.floor(midi / 12) - 1}`).join(' ')
-      instance.tex(`\\title "${title.replace(/["\\]/g, '')}" \\track "Guitar" \\staff {tabs} \\tuning (${tuningText}) ${body || 'r.4'}`)
+instance.tex(`\\title "${title.replace(/["\\]/g, '')}" \\track "Guitar" \\staff {tabs} \\tuning (${tuningText}) \\tempo ${bpm} . ${body}`)
     }).catch(() => setError('譜面ビューを読み込めませんでした。'))
     return () => { cancelled = true; api?.destroy() }
-  }, [notes, tuning, title])
-  return <div className="modal-backdrop" onClick={onClose}><div className="score-modal" onClick={event => event.stopPropagation()}><div className="modal-head"><div><span>ALPHATAB PREVIEW</span><h2>TAB 譜を確認</h2></div><button onClick={onClose} aria-label="閉じる"><X size={20}/></button></div><p>編集した音の弦・フレットを譜面で確認できます。音価はプレビュー用に均等配置しています。</p><ChordSheet events={chartEvents} title={title}/>{error ? <div className="error-state">{error}</div> : <div className="score-render" ref={container}/>}</div></div>
+  }, [notes, tuning, title, bpm])
+  return <div className="modal-backdrop" onClick={onClose}><div className="score-modal" onClick={event => event.stopPropagation()}><div className="modal-head"><div><span>ALPHATAB PREVIEW</span><h2>TAB 譜を確認</h2></div><button onClick={onClose} aria-label="閉じる"><X size={20}/></button></div><p>音の開始位置を推定 BPM の16分音符グリッドで表示します。音の長さはプレビュー用です。</p><ChordSheet events={chartEvents} title={title}/>{error ? <div className="error-state">{error}</div> : <div className="score-render" ref={container}/>}</div></div>
 }
 
 function createMusicXml(notes: Note[], tuning: number[], title: string) {

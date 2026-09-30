@@ -1,4 +1,4 @@
-"""Estimate chord changes from guitar audio and detected notes."""
+"""Estimate chord changes from a mix of pitched accompaniment instruments."""
 from __future__ import annotations
 
 import math
@@ -70,11 +70,16 @@ def _candidates(tuning: list[int]) -> list[tuple[str, tuple[int, ...], set[int],
     return list(best.values())
 
 
-def _audio_profiles(path: str | Path, count: int, window_seconds: float) -> np.ndarray:
+def _audio_profiles(path: str | Path, boundaries: list[float]) -> np.ndarray:
     with wave.open(str(path), "rb") as audio_file:
         rate = audio_file.getframerate()
+        channels = audio_file.getnchannels()
+        if audio_file.getsampwidth() != 2:
+            raise ValueError("コード解析には16-bit PCM WAV が必要です。")
         samples = np.frombuffer(audio_file.readframes(audio_file.getnframes()), dtype="<i2").astype(np.float32)
-    profiles = np.zeros((count, 12), dtype=np.float64)
+        if channels > 1:
+            samples = samples.reshape(-1, channels).mean(axis=1)
+    profiles = np.zeros((len(boundaries) - 1, 12), dtype=np.float64)
     if not samples.size:
         return profiles
     size = 8192
@@ -88,7 +93,7 @@ def _audio_profiles(path: str | Path, count: int, window_seconds: float) -> np.n
         if len(frame) < size:
             frame = np.pad(frame, (0, size - len(frame)))
         spectrum = abs(np.fft.rfft(frame * window))
-        index = min(count - 1, int((position / rate + size / rate / 2) / window_seconds))
+        index = min(len(profiles) - 1, max(0, int(np.searchsorted(boundaries, position / rate + size / rate / 2, side="right") - 1)))
         for pitch_class, nearby in bins:
             if nearby.size:
                 profiles[index, pitch_class] += float(np.max(spectrum[nearby])) ** .7
@@ -96,22 +101,29 @@ def _audio_profiles(path: str | Path, count: int, window_seconds: float) -> np.n
 
 
 def suggest_chords(notes: list[dict], tuning: list[int], duration: float,
-                   audio_path: str | Path | None = None, window_seconds: float = 1.0) -> list[dict]:
+                   audio_path: str | Path | None = None, window_seconds: float = 1.0,
+                   beat_times: list[float] | None = None) -> list[dict]:
     candidates = _candidates(tuning)
     if not candidates or duration <= 0:
         return []
-    count = math.ceil(duration / window_seconds)
-    profiles = _audio_profiles(audio_path, count, window_seconds) if audio_path else np.zeros((count, 12))
+    if beat_times and len(beat_times) >= 2:
+        boundaries = sorted({0.0, duration, *(time for time in beat_times if 0 < time < duration)})
+    else:
+        boundaries = [min(duration, index * window_seconds) for index in range(math.ceil(duration / window_seconds) + 1)]
+        if boundaries[-1] < duration:
+            boundaries.append(duration)
+    count = len(boundaries) - 1
+    profiles = _audio_profiles(audio_path, boundaries) if audio_path else np.zeros((count, 12))
     note_profiles = np.zeros_like(profiles)
     for note in notes:
-        start = max(0, int(note["onset_seconds"] // window_seconds))
-        end = min(count, int(note["offset_seconds"] // window_seconds) + 1)
+        start = max(0, int(np.searchsorted(boundaries, note["onset_seconds"], side="right") - 1))
+        end = min(count, int(np.searchsorted(boundaries, note["offset_seconds"], side="left") + 1))
         for index in range(start, end):
-            overlap = max(0, min(note["offset_seconds"], (index + 1) * window_seconds) -
-                          max(note["onset_seconds"], index * window_seconds))
+            overlap = max(0, min(note["offset_seconds"], boundaries[index + 1]) -
+                          max(note["onset_seconds"], boundaries[index]))
             note_profiles[index, note["pitch"] % 12] += overlap * note.get("confidence", 1)
 
-    # Keep a pre-normalization energy reference for genuinely silent guitar windows.
+    # Keep a pre-normalization reference for genuinely silent harmonic windows.
     audio_energy = profiles.sum(axis=1).copy()
     note_energy = note_profiles.sum(axis=1).copy()
     silence_floor = float(audio_energy.max(initial=0)) * .035
@@ -119,7 +131,7 @@ def suggest_chords(notes: list[dict], tuning: list[int], duration: float,
     # Normalize the two evidence sources separately so recording level does not decide the chord.
     profiles /= np.maximum(profiles.sum(axis=1, keepdims=True), 1e-9)
     note_profiles /= np.maximum(note_profiles.sum(axis=1, keepdims=True), 1e-9)
-    profiles = profiles * .65 + note_profiles * .35
+    profiles = profiles * .65 + note_profiles * .35 if note_energy.max(initial=0) > 0 else profiles
 
     # Dynamic programming keeps an entire progression coherent instead of deciding
     # each window independently. A clear new chord still wins over the change cost.
@@ -134,6 +146,7 @@ def suggest_chords(notes: list[dict], tuning: list[int], duration: float,
             + .25 * profile[root]
             + .4 * profile[(root + (3 if name.endswith(('m', 'm7')) else 4)) % 12]
             - difficulty - (.08 if name.endswith('7') else 0)
+            - (.25 * max(0, .12 - profile[(root + 10) % 12]) / .12 if name.endswith('7') else 0)
             for name, _, pitches, root, difficulty in candidates
         ])
         transitions = scores[:, None] - change_cost
@@ -150,13 +163,13 @@ def suggest_chords(notes: list[dict], tuning: list[int], duration: float,
     for index, state in enumerate(chosen):
         if silent[index] or profiles[index].sum() < .03:
             if not events or events[-1]["chord"] != "N.C.":
-                events.append({"id": uuid4().hex, "time_seconds": round(index * window_seconds, 2),
+                events.append({"id": uuid4().hex, "time_seconds": round(boundaries[index], 3),
                                "chord": "N.C.", "lyric": "", "frets": [-1] * 6})
             continue
         name, shape, _, _, _ = candidates[state]
         if events and events[-1]["chord"] == name:
             continue
-        events.append({"id": uuid4().hex, "time_seconds": round(index * window_seconds, 2),
+        events.append({"id": uuid4().hex, "time_seconds": round(boundaries[index], 3),
                        "chord": name, "lyric": "", "frets": list(shape)})
     return events
 

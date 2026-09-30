@@ -118,7 +118,7 @@ export function ChartEditor({ events, lyrics = [], title, playhead, duration, pl
     finally { setSaving(false) }
   }
   return <div className="chart-editor">
-    <div className="chart-editor-intro"><strong>歌詞とコード図</strong><p>音源から推定した歌詞と基本コードの候補です。聴き比べて修正できます。フレットは低音弦から高音弦の順です。タブを切り替える前に変更を保存してください。</p></div>
+    <div className="chart-editor-intro"><strong>歌詞とコード進行</strong><p>和声パートから推定したコードと歌詞の候補です。コード名・時刻・押さえ方を修正して保存すると、伴奏 TAB と試聴音声にも反映されます。フレットは低音弦から高音弦の順です。</p></div>
     <ChordSheet events={draft} title={title} playhead={playhead} duration={duration} playing={playing}/>
     <div className="chart-controls"><button onClick={add}><Plus size={15}/> 再生位置に追加</button><button className="chart-save" onClick={save} disabled={!dirty || saving}><Save size={15}/> {saving ? '保存中...' : '変更を保存'}</button></div>
     {error && <div className="chart-error">{error}</div>}

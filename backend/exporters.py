@@ -16,7 +16,7 @@ def _child(parent: Element, tag: str, value: object | None = None, **attrs: str)
     return node
 
 
-def musicxml(notes: list[dict], tuning: list[int], title: str) -> bytes:
+def musicxml(notes: list[dict], tuning: list[int], title: str, bpm: float | None = None) -> bytes:
     root = Element("score-partwise", version="4.0")
     _child(_child(root, "work"), "work-title", title)
     _child(root, "movement-title", title)
@@ -28,9 +28,10 @@ def musicxml(notes: list[dict], tuning: list[int], title: str) -> bytes:
     _child(instrument, "midi-program", 25)
     part = _child(root, "part", id="P1")
     ordered = sorted(notes, key=lambda n: (n["onset_seconds"], n["pitch"]))
-    # 120 BPM, 4/4. Onsets are placed on a 16th-note grid; this is intentionally
-    # a first-pass rhythm transcription, not a claim of exact meter detection.
-    count = max(1, math.ceil(max((n["offset_seconds"] for n in ordered), default=0) / 2))
+    tempo = bpm if bpm and 60 <= bpm <= 200 else 120.0
+    ticks_per_second = 480 * tempo / 60
+    # A 4/4 display grid is assumed; only tempo and beat positions are estimated.
+    count = max(1, math.ceil(max((n["offset_seconds"] for n in ordered), default=0) * ticks_per_second / 1920))
     for measure_idx in range(count):
         measure = _child(part, "measure", number=str(measure_idx + 1))
         if measure_idx == 0:
@@ -50,10 +51,15 @@ def musicxml(notes: list[dict], tuning: list[int], title: str) -> bytes:
                 if ALTERS[midi % 12]:
                     _child(staff_tuning, "tuning-alter", 1)
                 _child(staff_tuning, "tuning-octave", midi // 12 - 1)
+            direction = _child(measure, "direction", placement="above")
+            metronome = _child(_child(direction, "direction-type"), "metronome")
+            _child(metronome, "beat-unit", "quarter")
+            _child(metronome, "per-minute", round(tempo, 1))
+            _child(direction, "sound", tempo=str(round(tempo, 1)))
         measure_start = measure_idx * 1920
         measure_end = measure_start + 1920
         cursor = measure_start
-        entries = [(round(item["onset_seconds"] * 8) * 120, item) for item in ordered]
+        entries = [(round(item["onset_seconds"] * ticks_per_second / 120) * 120, item) for item in ordered]
         entries = [(onset, item) for onset, item in entries if measure_start <= onset < measure_end]
         groups: dict[int, list[dict]] = {}
         for onset, item in entries:
@@ -63,7 +69,7 @@ def musicxml(notes: list[dict], tuning: list[int], title: str) -> bytes:
                 _child(_child(measure, "forward"), "duration", onset - cursor)
             elif onset < cursor:
                 _child(_child(measure, "backup"), "duration", cursor - onset)
-            length = min(measure_end - onset, max(120, round(max(item["offset_seconds"] - item["onset_seconds"] for item in group) * 8) * 120))
+            length = min(measure_end - onset, max(120, round(max(item["offset_seconds"] - item["onset_seconds"] for item in group) * ticks_per_second / 120) * 120))
             duration_name = min([120, 240, 360, 480, 720, 960, 1440, 1920], key=lambda value: abs(value - length))
             type_name, dotted = {120: ("16th", False), 240: ("eighth", False), 360: ("eighth", True),
                                  480: ("quarter", False), 720: ("quarter", True), 960: ("half", False),
@@ -98,15 +104,17 @@ def _vlq(value: int) -> bytes:
     return bytes(result)
 
 
-def midi(notes: list[dict]) -> bytes:
+def midi(notes: list[dict], bpm: float | None = None) -> bytes:
+    tempo = bpm if bpm and 60 <= bpm <= 200 else 120.0
+    ticks_per_second = 480 * tempo / 60
     events = []
     for note in notes:
         pitch = max(0, min(127, int(note["pitch"])))
-        events.append((round(note["onset_seconds"] * 960), bytes([0x90, pitch, 80])))
-        events.append((round(note["offset_seconds"] * 960), bytes([0x80, pitch, 0])))
+        events.append((round(note["onset_seconds"] * ticks_per_second), bytes([0x90, pitch, 80])))
+        events.append((round(note["offset_seconds"] * ticks_per_second), bytes([0x80, pitch, 0])))
     events.sort(key=lambda e: (e[0], e[1][0]))
     track = io.BytesIO()
-    track.write(b"\x00\xff\x51\x03\x07\xa1\x20")
+    track.write(b"\x00\xff\x51\x03" + round(60_000_000 / tempo).to_bytes(3, "big"))
     previous = 0
     for tick, data in events:
         track.write(_vlq(max(0, tick - previous)))

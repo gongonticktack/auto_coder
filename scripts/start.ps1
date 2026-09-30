@@ -225,7 +225,7 @@ try {
     Assert-Exit 'pip install'
     Set-Content -LiteralPath $apiStamp -Value $requirementsHash -Encoding ascii
   }
-  & $venvPython -c 'from imageio_ffmpeg import get_ffmpeg_exe; from basic_pitch import ICASSP_2022_MODEL_PATH; import tensorflow, demucs, faster_whisper; from backend.transcription import predict_notes; print(get_ffmpeg_exe()); print(ICASSP_2022_MODEL_PATH)'
+  & $venvPython -c 'from imageio_ffmpeg import get_ffmpeg_exe; import demucs, faster_whisper, librosa; from backend.arrangement import arrange_accompaniment; print(get_ffmpeg_exe())'
   Assert-Exit 'Audio dependency check'
 
   $env:TORCH_HOME = Join-Path $runtime 'torch'

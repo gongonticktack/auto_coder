@@ -32,12 +32,15 @@ export type Job = {
   start_seconds: number
   end_seconds: number | null
   tuning: number[]
+  bpm?: number | null
+  beat_times?: number[]
   notes: Note[]
   chart_events?: ChartEvent[]
   lyrics?: LyricPhrase[]
   lyrics_error?: string | null
   audio_url: string | null
   stem_url: string | null
+  harmony_url?: string | null
   vocal_url?: string | null
   backing_url?: string | null
 }

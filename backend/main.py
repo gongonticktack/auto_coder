@@ -18,10 +18,10 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from .exporters import midi, musicxml
+from .beats import estimate_beats
+from .arrangement import arrange_accompaniment
 from .chords import attach_lyrics, suggest_chords
-from .fingering import assign_fingerings
 from .lyrics import transcribe_lyrics
-from .transcription import predict_notes
 
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data" / "jobs"
@@ -34,6 +34,7 @@ TUNINGS = {
 }
 MAX_FILE_BYTES = 100 * 1024 * 1024
 ALLOWED = {".wav", ".mp3", ".m4a", ".flac", ".ogg", ".aac"}
+SEPARATION_STEMS = ("vocals", "bass", "drums", "guitar", "piano", "other")
 locks: dict[str, Lock] = {}
 
 app = FastAPI(title="Fretlab API", version="0.1.0")
@@ -134,6 +135,24 @@ def _make_backing(directory: Path) -> Path:
     return destination
 
 
+def _make_harmony(directory: Path) -> Path:
+    """Combine every pitched accompaniment stem, excluding drums and vocals."""
+    destination = directory / "harmony.wav"
+    if destination.exists():
+        return destination
+    stems = [next(iter((directory / "stems").glob(f"**/{name}.wav")), None)
+             for name in ("bass", "guitar", "piano", "other")]
+    if any(path is None for path in stems):
+        raise FileNotFoundError("コード推定用の伴奏パートが見つかりません。")
+    temporary = directory / "harmony.tmp.wav"
+    _run([_ffmpeg_executable(), "-y", "-hide_banner", "-loglevel", "error",
+          *(item for path in stems for item in ("-i", str(path))),
+          "-filter_complex", "[0:a][1:a][2:a][3:a]amix=inputs=4:duration=longest:normalize=0,alimiter=limit=0.95",
+          "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(temporary)])
+    temporary.replace(destination)
+    return destination
+
+
 def _process(job_id: str) -> None:
     directory = _directory(job_id)
     job = _load(job_id)
@@ -149,7 +168,7 @@ def _process(job_id: str) -> None:
         if job["segment_enabled"]:
             command += ["-t", str(job["end_seconds"] - job["start_seconds"])]
         # Keep stereo and Demucs's native 44.1 kHz bandwidth during separation.
-        # Pitch estimation gets its own mono 22.05 kHz conversion below.
+        # Chord analysis gets its own mono 22.05 kHz conversion below.
         command += ["-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(normalized)]
         _run(command)
         if not normalized.exists() or normalized.stat().st_size < 500:
@@ -158,45 +177,44 @@ def _process(job_id: str) -> None:
             duration = audio_file.getnframes() / audio_file.getframerate()
         _update(job_id, duration_seconds=duration,
                 end_seconds=job["start_seconds"] + duration)
-        _update(job_id, stage="ギターとボーカルを分離", progress=25, audio_url=f"/api/jobs/{job_id}/audio/original")
-        guitar = normalized
+        _update(job_id, stage="和声パートを分離", progress=25, audio_url=f"/api/jobs/{job_id}/audio/original")
+        harmony = normalized
+        beat_source = normalized
         if os.getenv("FRETLAB_SKIP_DEMUCS") != "1":
             output = directory / "stems"
             _run([sys.executable, "-m", "demucs", "-n", "htdemucs_6s",
                   "--shifts", "2", "--overlap", "0.5", "-o", str(output), str(normalized)])
-            candidates = list(output.glob("**/guitar.wav"))
-            if not candidates:
-                raise RuntimeError("Demucs の guitar ステムを見つけられませんでした。")
-            guitar = candidates[0]
+            harmony = _make_harmony(directory)
+            drum_candidates = list(output.glob("**/drums.wav"))
+            if drum_candidates:
+                beat_source = drum_candidates[0]
             _make_backing(directory)
             _update(job_id, stem_url=f"/api/jobs/{job_id}/audio/guitar",
+                    harmony_url=f"/api/jobs/{job_id}/audio/harmony",
                     vocal_url=f"/api/jobs/{job_id}/audio/vocals",
                     backing_url=f"/api/jobs/{job_id}/audio/backing")
             vocal_candidates = list(output.glob("**/vocals.wav"))
             vocals = vocal_candidates[0] if vocal_candidates else normalized
         else:
             vocals = normalized
-        _update(job_id, stage="音符を推定", progress=50)
-        pitch_audio = directory / "pitch_input.wav"
-        _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(guitar),
-              "-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le", str(pitch_audio)])
-        estimated = predict_notes(pitch_audio)
-        notes = []
-        for index, item in enumerate(estimated):
-            onset, offset, pitch, amplitude = item[:4]
-            if offset - onset < .08:
-                continue
-            notes.append({
-                "id": uuid4().hex, "pitch": int(pitch),
-                "onset_seconds": round(float(onset), 3), "offset_seconds": round(float(offset), 3),
-                "confidence": round(max(0, min(1, float(amplitude))), 3),
-                "string": 0, "fret": -1, "technique": "", "source_model": "basic-pitch",
-            })
-        _update(job_id, stage="運指を最適化", progress=70)
-        notes = assign_fingerings(notes, job["tuning"])
-        notes = [note for note in notes if note["string"] > 0]
-        _update(job_id, stage="コードを推定", progress=78)
-        chart_events = suggest_chords(notes, job["tuning"], duration, pitch_audio)
+        _update(job_id, stage="BPM と拍を推定", progress=43)
+        try:
+            bpm, beat_times = estimate_beats(beat_source, duration)
+        except Exception:
+            bpm, beat_times = None, []
+        if bpm is None and beat_source != normalized:
+            try:
+                bpm, beat_times = estimate_beats(normalized, duration)
+            except Exception:
+                pass
+        _update(job_id, bpm=bpm, beat_times=beat_times)
+        _update(job_id, stage="伴奏のコード進行を推定", progress=50)
+        harmony_audio = directory / "harmony_input.wav"
+        _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(harmony),
+              "-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le", str(harmony_audio)])
+        chart_events = suggest_chords([], job["tuning"], duration, harmony_audio, beat_times=beat_times)
+        _update(job_id, stage="弾き語り伴奏を編曲", progress=76)
+        notes = arrange_accompaniment(chart_events, job["tuning"], duration, beat_times, bpm)
         _update(job_id, stage="歌詞を認識（初回はモデルを取得）", progress=88)
         lyrics = []
         lyrics_error = None
@@ -210,6 +228,91 @@ def _process(job_id: str) -> None:
                 lyrics_error=lyrics_error, status="completed", stage="完了", progress=100)
     except Exception as exc:
         _update(job_id, status="failed", stage="エラー", error=str(exc), progress=0)
+
+
+def _process_separation(job_id: str) -> None:
+    directory = _directory(job_id)
+    try:
+        ffmpeg = _ffmpeg_executable()
+        source = next(directory.glob("source.*"))
+        normalized = directory / "normalized.wav"
+        _update(job_id, status="running", stage="音源を準備中", progress=5)
+        _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(source),
+              "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le", str(normalized)])
+        if not normalized.exists() or normalized.stat().st_size < 500:
+            raise RuntimeError("解析できる音声がありません。")
+        _update(job_id, stage="6つのパートを分離中", progress=20)
+        output = directory / "stems"
+        _run([sys.executable, "-m", "demucs", "-n", "htdemucs_6s",
+              "--shifts", "2", "--overlap", "0.5", "-o", str(output), str(normalized)])
+        wavs = {}
+        for stem in SEPARATION_STEMS:
+            candidates = list(output.glob(f"**/{stem}.wav"))
+            if not candidates:
+                raise RuntimeError(f"{stem} の分離音声が生成されませんでした。")
+            wavs[stem] = candidates[0]
+        mp3_dir = directory / "mp3"
+        mp3_dir.mkdir()
+        for index, stem in enumerate(SEPARATION_STEMS):
+            _update(job_id, stage=f"{stem} を MP3 に変換中", progress=70 + index * 5)
+            destination = mp3_dir / f"{stem}.mp3"
+            _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(wavs[stem]),
+                  "-codec:a", "libmp3lame", "-b:a", "192k", str(destination)])
+            if not destination.exists() or destination.stat().st_size == 0:
+                raise RuntimeError(f"{stem} の MP3 を生成できませんでした。")
+        _update(job_id, status="completed", stage="完了", progress=100,
+                stems={stem: f"/api/separations/{job_id}/stems/{stem}" for stem in SEPARATION_STEMS})
+    except Exception as exc:
+        _update(job_id, status="failed", stage="エラー", error=str(exc), progress=0)
+
+
+@app.post("/api/separations", status_code=202)
+async def create_separation(background_tasks: BackgroundTasks, file: UploadFile = File(...)) -> dict:
+    extension = Path(file.filename or "").suffix.lower()
+    if extension not in ALLOWED:
+        raise HTTPException(400, "対応する音声ファイルを選んでください。")
+    job_id = uuid4().hex
+    directory = DATA / job_id
+    directory.mkdir()
+    locks[job_id] = Lock()
+    size = 0
+    try:
+        with (directory / f"source{extension}").open("wb") as destination:
+            while chunk := await file.read(1024 * 1024):
+                size += len(chunk)
+                if size > MAX_FILE_BYTES:
+                    raise HTTPException(413, "音源は 100 MB 以下にしてください。")
+                destination.write(chunk)
+        if not size:
+            raise HTTPException(400, "空のファイルです。")
+    except Exception:
+        shutil.rmtree(directory)
+        locks.pop(job_id, None)
+        raise
+    job = {"id": job_id, "status": "queued", "stage": "待機中", "progress": 0,
+           "error": None, "title": Path(file.filename or "audio").stem[:160], "stems": {}}
+    _save(job)
+    background_tasks.add_task(_process_separation, job_id)
+    return job
+
+
+@app.get("/api/separations/{job_id}")
+def get_separation(job_id: str) -> dict:
+    job = _load(job_id)
+    if "stems" not in job:
+        raise HTTPException(404, "分離ジョブが見つかりません。")
+    return job
+
+
+@app.get("/api/separations/{job_id}/stems/{stem}")
+def get_separation_stem(job_id: str, stem: str) -> FileResponse:
+    job = get_separation(job_id)
+    if stem not in SEPARATION_STEMS or job["status"] != "completed":
+        raise HTTPException(404, "分離音声が見つかりません。")
+    path = _directory(job_id) / "mp3" / f"{stem}.mp3"
+    if not path.is_file():
+        raise HTTPException(404, "分離音声が見つかりません。")
+    return FileResponse(path, media_type="audio/mpeg")
 
 
 @app.get("/api/health")
@@ -230,7 +333,6 @@ async def create_job(
     start_seconds: float = Form(0),
     end_seconds: float | None = Form(None),
     tuning: str = Form("Standard E"),
-    part: str = Form("Lead guitar"),
 ) -> dict:
     extension = Path(file.filename or "").suffix.lower()
     if extension not in ALLOWED:
@@ -266,8 +368,8 @@ async def create_job(
         "title": title[:160] or "Untitled", "duration_seconds": None,
         "segment_enabled": segment_enabled,
         "start_seconds": start_seconds, "end_seconds": end_seconds,
-        "tuning": TUNINGS[tuning], "tuning_name": tuning, "part": part[:50],
-        "notes": [], "audio_url": None, "stem_url": None, "vocal_url": None, "backing_url": None,
+        "tuning": TUNINGS[tuning], "tuning_name": tuning, "part": "弾き語り伴奏", "generation_mode": "accompaniment",
+        "notes": [], "bpm": None, "beat_times": [], "audio_url": None, "stem_url": None, "harmony_url": None, "vocal_url": None, "backing_url": None,
         "chart_events": [], "lyrics": [], "lyrics_error": None,
     }
     _save(job)
@@ -288,6 +390,8 @@ def get_audio(job_id: str, kind: str) -> FileResponse:
     elif kind == "guitar":
         candidates = list((directory / "stems").glob("**/guitar.wav"))
         path = candidates[0] if candidates else directory / "missing.wav"
+    elif kind == "harmony":
+        path = directory / "harmony.wav"
     elif kind == "vocals":
         candidates = list((directory / "stems").glob("**/vocals.wav"))
         path = candidates[0] if candidates else directory / "missing.wav"
@@ -364,6 +468,9 @@ def update_chart(job_id: str, update: ChartUpdate) -> dict:
         if any(event.time_seconds > duration for event in update.events):
             raise HTTPException(400, "配置時刻が音源の長さを超えています。")
         job["chart_events"] = [event.model_dump() for event in sorted(update.events, key=lambda item: item.time_seconds)]
+        if job.get("generation_mode") == "accompaniment":
+            job["notes"] = arrange_accompaniment(job["chart_events"], job["tuning"], duration,
+                                                   job.get("beat_times"), job.get("bpm"))
     return _mutate(job_id, operation)
 
 
@@ -373,11 +480,11 @@ def export(job_id: str, kind: str) -> Response:
     if job["status"] != "completed":
         raise HTTPException(409, "解析完了後に書き出せます。")
     if kind == "musicxml":
-        data = musicxml(job["notes"], job["tuning"], job["title"])
+        data = musicxml(job["notes"], job["tuning"], job["title"], job.get("bpm"))
         media_type = "application/vnd.recordare.musicxml+xml"
         suffix = "musicxml"
     elif kind == "midi":
-        data = midi(job["notes"])
+        data = midi(job["notes"], job.get("bpm"))
         media_type = "audio/midi"
         suffix = "mid"
     else:

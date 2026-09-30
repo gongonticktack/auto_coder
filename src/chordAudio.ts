@@ -1,4 +1,4 @@
-import type { ChartEvent } from './types'
+import type { ChartEvent, Note } from './types'
 
 const SAMPLE_RATE = 22050
 const SAMPLE_ROOT = '/samples/acoustic-guitar'
@@ -82,22 +82,33 @@ function writeWav(left: Float32Array, right: Float32Array): Blob {
 }
 
 /** Use recorded CC0 nylon-guitar notes to play each saved fret shape. */
-export async function renderChordAudio(events: ChartEvent[], tuning: number[], duration: number): Promise<Blob> {
+export async function renderChordAudio(events: ChartEvent[], tuning: number[], duration: number, notes: Note[] = []): Promise<Blob> {
   const available = await availableSamples()
   if (!available.length) throw new Error('ギター音源がありません。')
   const chords = events.filter(event => event.chord.trim() && event.chord !== 'N.C.' && event.frets.some(fret => fret >= 0))
+  const arranged = notes.filter(note => note.source_model === 'chord-arrangement')
+  const grouped = new Map<string, { time_seconds: number, frets: number[], technique: string }>()
+  for (const note of arranged) {
+    const key = note.onset_seconds.toFixed(3)
+    const stroke = grouped.get(key) || { time_seconds: note.onset_seconds, frets: [-1, -1, -1, -1, -1, -1], technique: note.technique }
+    stroke.frets[6 - note.string] = note.fret
+    grouped.set(key, stroke)
+  }
+  const strokes = grouped.size ? [...grouped.values()].sort((a, b) => a.time_seconds - b.time_seconds)
+    : chords.map(chord => ({ time_seconds: chord.time_seconds, frets: chord.frets, technique: 'strum-down' }))
   const pitches = new Set<number>()
-  for (const event of chords) for (let string = 0; string < 6; string++) {
+  for (const event of strokes) for (let string = 0; string < 6; string++) {
     if (event.frets[string] >= 0) pitches.add(sampleFor(tuning[5 - string] + event.frets[string], available))
   }
   await Promise.all([...pitches].map(loadSample))
   const length = Math.max(1, Math.ceil(duration * SAMPLE_RATE))
   const left = new Float32Array(length)
   const right = new Float32Array(length)
-  for (const event of chords) {
+  for (const event of strokes) {
     if (!Number.isFinite(event.time_seconds) || event.time_seconds < 0 || event.time_seconds >= duration) continue
     let played = 0
-    for (let string = 0; string < 6; string++) {
+    const order = event.technique === 'strum-up' ? [5, 4, 3, 2, 1, 0] : [0, 1, 2, 3, 4, 5]
+    for (const string of order) {
       const fret = event.frets[string]
       if (!Number.isInteger(fret) || fret < 0 || fret > 24) continue
       const pitch = tuning[5 - string] + fret
