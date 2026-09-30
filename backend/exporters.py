@@ -110,7 +110,8 @@ def midi(notes: list[dict], bpm: float | None = None) -> bytes:
     events = []
     for note in notes:
         pitch = max(0, min(127, int(note["pitch"])))
-        events.append((round(note["onset_seconds"] * ticks_per_second), bytes([0x90, pitch, 80])))
+        velocity = max(1, min(127, int(note.get("velocity", 80))))
+        events.append((round(note["onset_seconds"] * ticks_per_second), bytes([0x90, pitch, velocity])))
         events.append((round(note["offset_seconds"] * ticks_per_second), bytes([0x80, pitch, 0])))
     events.sort(key=lambda e: (e[0], e[1][0]))
     track = io.BytesIO()

@@ -4,6 +4,7 @@ export type Note = {
   onset_seconds: number
   offset_seconds: number
   confidence: number
+  velocity?: number
   string: number
   fret: number
   technique: string
@@ -34,6 +35,7 @@ export type Job = {
   tuning: number[]
   bpm?: number | null
   beat_times?: number[]
+  groove?: {time_seconds: number, energy: number, offbeat: boolean}[]
   notes: Note[]
   chart_events?: ChartEvent[]
   lyrics?: LyricPhrase[]

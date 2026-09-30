@@ -9,6 +9,7 @@ from pathlib import Path
 import numpy as np
 
 from .arrangement import arrange_accompaniment
+from .beats import analyze_groove
 from .chords import suggest_chords
 from .main import _make_harmony
 
@@ -70,11 +71,16 @@ class ArrangementTests(unittest.TestCase):
                              [(0, "C"), (4, "G")])
             notes = arrange_accompaniment(events, TUNING, 8, beats, 120)
             self.assertTrue(notes)
-            self.assertTrue(all(note["onset_seconds"] in beats for note in notes))
+            self.assertTrue(all(note["onset_seconds"] in beats or
+                                any(abs(note["onset_seconds"] - beat - .25) < .001 for beat in beats)
+                                for note in notes))
             self.assertTrue(all(note["pitch"] == TUNING[note["string"] - 1] + note["fret"]
                                 for note in notes))
             self.assertTrue(all(note["source_model"] == "chord-arrangement" for note in notes))
-            self.assertEqual({note["onset_seconds"] for note in notes}, set(beats))
+            onsets = {note["onset_seconds"] for note in notes}
+            self.assertEqual({round(time, 3) for time in (0, .5, 1.25, 1.5)},
+                             {time for time in onsets if time < 2})
+            self.assertFalse({.25, .75, 1, 1.75} & onsets)
 
     def test_no_chord_and_edited_voicing_update_arrangement(self) -> None:
         events = [
@@ -89,6 +95,57 @@ class ArrangementTests(unittest.TestCase):
         edited[2]["frets"] = [3, 2, 0, 0, 3, 3]
         changed = arrange_accompaniment(edited, TUNING, 4, beats, 120)
         self.assertIn(3, {note["fret"] for note in changed if note["string"] == 2})
+
+    def test_chord_change_between_pattern_hits_replaces_nearby_stroke(self) -> None:
+        events = [
+            {"time_seconds": 0, "chord": "C", "frets": [-1, 3, 2, 0, 1, 0]},
+            {"time_seconds": 1.22, "chord": "G", "frets": [3, 2, 0, 0, 0, 3]},
+        ]
+        notes = arrange_accompaniment(events, TUNING, 2, [0, .5, 1, 1.5], 120)
+        onsets = {note["onset_seconds"] for note in notes}
+        self.assertIn(1.22, onsets)
+        self.assertNotIn(1.25, onsets)
+        self.assertTrue(all(note["technique"] == "strum-down"
+                            for note in notes if note["onset_seconds"] == 1.22))
+
+    def test_groove_changes_playing_style_and_dynamics(self) -> None:
+        events = [{"time_seconds": 0, "chord": "C", "frets": [-1, 3, 2, 0, 1, 0]}]
+        beats = [i * .5 for i in range(16)]
+        groove = [{"time_seconds": beat, "energy": .12 if i < 8 else .9,
+                   "offbeat": i >= 8} for i, beat in enumerate(beats)]
+        notes = arrange_accompaniment(events, TUNING, 8, beats, 120, groove)
+        early = [note for note in notes if 0 < note["onset_seconds"] < 4]
+        late = [note for note in notes if note["onset_seconds"] >= 4]
+        self.assertIn("bass-pick", {note["technique"] for note in early})
+        self.assertIn("treble-pick", {note["technique"] for note in early})
+        self.assertIn("strum-up", {note["technique"] for note in late})
+        self.assertIn("strum-muted", {note["technique"] for note in late})
+        self.assertTrue(any(note["onset_seconds"] % .5 > .001 for note in late))
+        self.assertGreater(min(note["velocity"] for note in late),
+                           max(note["velocity"] for note in early))
+
+    def test_audio_groove_detects_quiet_and_loud_sections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "groove.wav"
+            rate = 22050
+            samples = np.zeros(rate * 8, dtype=np.float64)
+            pulse = np.hanning(round(rate * .05))
+            for index in range(16):
+                start = round(index * .5 * rate)
+                samples[start:start + len(pulse)] += pulse * (.05 if index < 8 else .55)
+                if index >= 8:
+                    upbeat = start + round(.25 * rate)
+                    samples[upbeat:upbeat + len(pulse)] += pulse * .35
+            with wave.open(str(path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(rate)
+                output.writeframes((samples * 28000).astype("<i2").tobytes())
+            groove = analyze_groove(path, [i * .5 for i in range(16)], 8)
+            self.assertEqual(len(groove), 16)
+            self.assertLess(np.mean([item["energy"] for item in groove[:6]]),
+                            np.mean([item["energy"] for item in groove[10:]]))
+            self.assertTrue(any(item["offbeat"] for item in groove[8:]))
 
 
 if __name__ == "__main__":

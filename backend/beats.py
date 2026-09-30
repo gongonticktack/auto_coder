@@ -38,6 +38,48 @@ def estimate_beats(path: str | Path, duration: float) -> tuple[float | None, lis
     return round(60 / period, 1), [round(t, 3) for t in grid]
 
 
+def analyze_groove(path: str | Path, beats: list[float], duration: float) -> list[dict]:
+    """Measure phrase energy and offbeat attacks on an established beat grid."""
+    if len(beats) < 2:
+        return []
+    import librosa
+
+    audio, rate = librosa.load(str(path), sr=22050, mono=True)
+    if audio.size < rate or float(np.max(np.abs(audio))) < .002:
+        return []
+    hop = 256
+    onset = librosa.onset.onset_strength(y=audio, sr=rate, hop_length=hop)
+    if not onset.size:
+        return []
+    onset_times = librosa.frames_to_time(np.arange(len(onset)), sr=rate, hop_length=hop)
+    positive = onset[onset > 0]
+    attack_floor = float(np.percentile(positive, 55)) if positive.size else 0
+    raw_energy = []
+    offbeats = []
+    for index, beat in enumerate(beats):
+        period = beats[index + 1] - beat if index + 1 < len(beats) else beats[index] - beats[index - 1]
+        period = max(.15, period)
+        begin = max(0, round(beat * rate))
+        end = min(audio.size, round(min(duration, beat + period) * rate))
+        segment = audio[begin:end]
+        raw_energy.append(float(np.sqrt(np.mean(segment ** 2))) if segment.size else 0)
+        window = onset[(onset_times >= beat + .39 * period) &
+                       (onset_times <= beat + .65 * period)]
+        offbeats.append(bool(window.size and float(window.max()) > attack_floor * 1.35
+                             and float(window.max()) > .06))
+
+    # Smooth across a short phrase so a single kick does not change the playing style.
+    padded = np.pad(np.asarray(raw_energy), (1, 2), mode="edge")
+    energy = np.convolve(padded, np.ones(4) / 4, mode="valid")
+    low, high = np.percentile(energy, [15, 85])
+    if high - low < max(high * .12, 1e-5):
+        levels = np.full(len(beats), .5)
+    else:
+        levels = np.clip((energy - low) / (high - low), 0, 1)
+    return [{"time_seconds": round(beat, 3), "energy": round(float(level), 3),
+             "offbeat": offbeat} for beat, level, offbeat in zip(beats, levels, offbeats)]
+
+
 def quantize_notes(notes: list[dict], beats: list[float], duration: float) -> list[dict]:
     """Move nearby onsets/offsets to 16th-note positions without erasing off-grid phrasing."""
     if len(beats) < 2:

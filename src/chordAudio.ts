@@ -73,7 +73,7 @@ function writeWav(left: Float32Array, right: Float32Array): Blob {
   label(36, 'data'); view.setUint32(40, length * 4, true)
   let peak = 0
   for (let i = 0; i < length; i++) peak = Math.max(peak, Math.abs(left[i]), Math.abs(right[i]))
-  const scale = peak ? .9 / peak : 1
+  const scale = peak > .9 ? .9 / peak : 1
   for (let i = 0; i < length; i++) {
     view.setInt16(44 + i * 4, Math.round(Math.max(-1, Math.min(1, left[i] * scale)) * 32767), true)
     view.setInt16(46 + i * 4, Math.round(Math.max(-1, Math.min(1, right[i] * scale)) * 32767), true)
@@ -87,15 +87,17 @@ export async function renderChordAudio(events: ChartEvent[], tuning: number[], d
   if (!available.length) throw new Error('ギター音源がありません。')
   const chords = events.filter(event => event.chord.trim() && event.chord !== 'N.C.' && event.frets.some(fret => fret >= 0))
   const arranged = notes.filter(note => note.source_model === 'chord-arrangement')
-  const grouped = new Map<string, { time_seconds: number, frets: number[], technique: string }>()
+  const grouped = new Map<string, { time_seconds: number, offset_seconds: number, frets: number[], technique: string, velocity: number }>()
   for (const note of arranged) {
     const key = note.onset_seconds.toFixed(3)
-    const stroke = grouped.get(key) || { time_seconds: note.onset_seconds, frets: [-1, -1, -1, -1, -1, -1], technique: note.technique }
+    const stroke = grouped.get(key) || { time_seconds: note.onset_seconds, offset_seconds: note.offset_seconds,
+      frets: [-1, -1, -1, -1, -1, -1], technique: note.technique, velocity: note.velocity ?? 80 }
     stroke.frets[6 - note.string] = note.fret
     grouped.set(key, stroke)
   }
   const strokes = grouped.size ? [...grouped.values()].sort((a, b) => a.time_seconds - b.time_seconds)
-    : chords.map(chord => ({ time_seconds: chord.time_seconds, frets: chord.frets, technique: 'strum-down' }))
+    : chords.map(chord => ({ time_seconds: chord.time_seconds, offset_seconds: chord.time_seconds + .4,
+      frets: chord.frets, technique: 'strum-down', velocity: 80 }))
   const pitches = new Set<number>()
   for (const event of strokes) for (let string = 0; string < 6; string++) {
     if (event.frets[string] >= 0) pitches.add(sampleFor(tuning[5 - string] + event.frets[string], available))
@@ -104,7 +106,7 @@ export async function renderChordAudio(events: ChartEvent[], tuning: number[], d
   const length = Math.max(1, Math.ceil(duration * SAMPLE_RATE))
   const left = new Float32Array(length)
   const right = new Float32Array(length)
-  for (const event of strokes) {
+  for (const [strokeIndex, event] of strokes.entries()) {
     if (!Number.isFinite(event.time_seconds) || event.time_seconds < 0 || event.time_seconds >= duration) continue
     let played = 0
     const order = event.technique === 'strum-up' ? [5, 4, 3, 2, 1, 0] : [0, 1, 2, 3, 4, 5]
@@ -115,11 +117,17 @@ export async function renderChordAudio(events: ChartEvent[], tuning: number[], d
       const recordedPitch = sampleFor(pitch, available)
       const sample = await loadSample(recordedPitch)
       const rate = Math.pow(2, (pitch - recordedPitch) / 12)
-      const start = Math.round((event.time_seconds + played * .025) * SAMPLE_RATE)
-      const count = Math.min(Math.ceil(sample.length / rate), Math.round(SAMPLE_RATE * 3.5), length - start)
+      const spread = event.technique.endsWith('pick') ? .038 : event.technique === 'strum-muted' ? .008 : event.technique === 'strum-up' ? .011 : .014
+      const touch = ((strokeIndex * 7 + string * 3) % 5 - 2) * .0015
+      const start = Math.max(0, Math.round((event.time_seconds + played * spread + touch) * SAMPLE_RATE))
+      const sustain = event.technique === 'strum-muted' ? .16 : Math.max(.2, event.offset_seconds - event.time_seconds + .22)
+      const count = Math.max(0, Math.min(Math.ceil(sample.length / rate), Math.round(SAMPLE_RATE * sustain), length - start))
       const pan = (string - 2.5) * .075
-      const gainLeft = .27 * Math.sqrt((1 - pan) / 2)
-      const gainRight = .27 * Math.sqrt((1 + pan) / 2)
+      const strength = Math.max(.15, Math.min(1, event.velocity / 110))
+      const directionAccent = event.technique === 'strum-up' ? .82 + string * .036 : 1.04 - string * .035
+      const stringTouch = .96 + ((strokeIndex * 3 + string * 5) % 7) * .012
+      const gainLeft = .27 * strength * directionAccent * stringTouch * Math.sqrt((1 - pan) / 2)
+      const gainRight = .27 * strength * directionAccent * stringTouch * Math.sqrt((1 + pan) / 2)
       for (let i = 0; i < count; i++) {
         const position = i * rate
         const at = Math.floor(position)

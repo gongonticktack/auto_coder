@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 
 from .exporters import midi, musicxml
-from .beats import estimate_beats
+from .beats import analyze_groove, estimate_beats
 from .arrangement import arrange_accompaniment
 from .chords import attach_lyrics, suggest_chords
 from .lyrics import transcribe_lyrics
@@ -208,13 +208,18 @@ def _process(job_id: str) -> None:
             except Exception:
                 pass
         _update(job_id, bpm=bpm, beat_times=beat_times)
+        try:
+            groove = analyze_groove(normalized, beat_times, duration)
+        except Exception:
+            groove = []
+        _update(job_id, groove=groove)
         _update(job_id, stage="伴奏のコード進行を推定", progress=50)
         harmony_audio = directory / "harmony_input.wav"
         _run([ffmpeg, "-y", "-hide_banner", "-loglevel", "error", "-i", str(harmony),
               "-ac", "1", "-ar", "22050", "-c:a", "pcm_s16le", str(harmony_audio)])
         chart_events = suggest_chords([], job["tuning"], duration, harmony_audio, beat_times=beat_times)
         _update(job_id, stage="弾き語り伴奏を編曲", progress=76)
-        notes = arrange_accompaniment(chart_events, job["tuning"], duration, beat_times, bpm)
+        notes = arrange_accompaniment(chart_events, job["tuning"], duration, beat_times, bpm, groove)
         _update(job_id, stage="歌詞を認識（初回はモデルを取得）", progress=88)
         lyrics = []
         lyrics_error = None
@@ -369,7 +374,7 @@ async def create_job(
         "segment_enabled": segment_enabled,
         "start_seconds": start_seconds, "end_seconds": end_seconds,
         "tuning": TUNINGS[tuning], "tuning_name": tuning, "part": "弾き語り伴奏", "generation_mode": "accompaniment",
-        "notes": [], "bpm": None, "beat_times": [], "audio_url": None, "stem_url": None, "harmony_url": None, "vocal_url": None, "backing_url": None,
+        "notes": [], "bpm": None, "beat_times": [], "groove": [], "audio_url": None, "stem_url": None, "harmony_url": None, "vocal_url": None, "backing_url": None,
         "chart_events": [], "lyrics": [], "lyrics_error": None,
     }
     _save(job)
@@ -470,7 +475,7 @@ def update_chart(job_id: str, update: ChartUpdate) -> dict:
         job["chart_events"] = [event.model_dump() for event in sorted(update.events, key=lambda item: item.time_seconds)]
         if job.get("generation_mode") == "accompaniment":
             job["notes"] = arrange_accompaniment(job["chart_events"], job["tuning"], duration,
-                                                   job.get("beat_times"), job.get("bpm"))
+                                                   job.get("beat_times"), job.get("bpm"), job.get("groove"))
     return _mutate(job_id, operation)
 
 
