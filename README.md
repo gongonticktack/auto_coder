@@ -1,3 +1,5 @@
+💻 **ローカルWebアプリ：[Fretlabを開く](http://127.0.0.1:5173/)** — `start.bat`で起動したPC内で利用できます。
+
 # Fretlab（auto_coder）
 
 ## 概要
